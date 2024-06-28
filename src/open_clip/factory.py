@@ -26,7 +26,6 @@ from .model import (
     load_checkpoint,
     set_model_preprocess_cfg,
 )
-from .multi_tower_model import ThreeTowersCustomTextCLIP
 from .openai import load_openai_model
 from .pretrained import (
     download_pretrained,
@@ -253,10 +252,6 @@ def create_model(
         if custom_text:
             if 'multimodal_cfg' in model_cfg:
                 model = CoCa(**model_cfg, cast_dtype=cast_dtype, cache_dir=cache_dir)
-            elif 'teacher_cfg' in model_cfg:
-                model = ThreeTowersCustomTextCLIP(
-                    **model_cfg, cast_dtype=cast_dtype, cache_dir=cache_dir
-                )
             else:
                 model = CustomTextCLIP(
                     **model_cfg, cast_dtype=cast_dtype, cache_dir=cache_dir

@@ -1,7 +1,8 @@
-""" timm model adapter
+"""timm model adapter
 
 Wraps timm (https://github.com/rwightman/pytorch-image-models) models for use as a vision tower in CLIP model.
 """
+
 import logging
 from collections import OrderedDict
 

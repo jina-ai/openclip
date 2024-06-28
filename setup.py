@@ -1,8 +1,9 @@
 """ Setup
 """
-from setuptools import setup, find_packages
 from codecs import open
 from os import path
+
+from setuptools import find_packages, setup
 
 here = path.abspath(path.dirname(__file__))
 
@@ -10,13 +11,17 @@ here = path.abspath(path.dirname(__file__))
 with open(path.join(here, 'README.md'), encoding='utf-8') as f:
     long_description = f.read()
 
+
 def _read_reqs(relpath):
     fullpath = path.join(path.dirname(__file__), relpath)
     with open(fullpath) as f:
-        return [s.strip() for s in f.readlines() if (s.strip() and not s.startswith("#"))]
+        return [
+            s.strip() for s in f.readlines() if (s.strip() and not s.startswith('#'))
+        ]
 
-REQUIREMENTS = _read_reqs("requirements.txt")
-TRAINING_REQUIREMENTS = _read_reqs("requirements-training.txt")
+
+REQUIREMENTS = _read_reqs('requirements.txt')
+TRAINING_REQUIREMENTS = _read_reqs('requirements-training.txt')
 
 exec(open('src/open_clip/version.py').read())
 setup(
@@ -47,7 +52,6 @@ setup(
         'Topic :: Software Development :: Libraries',
         'Topic :: Software Development :: Libraries :: Python Modules',
     ],
-
     # Note that this is a string of words separated by whitespace, not a list.
     keywords='CLIP pretrained',
     package_dir={'': 'src'},
@@ -55,7 +59,7 @@ setup(
     include_package_data=True,
     install_requires=REQUIREMENTS,
     extras_require={
-        "training": TRAINING_REQUIREMENTS,
+        'training': TRAINING_REQUIREMENTS,
     },
     python_requires='>=3.7',
 )

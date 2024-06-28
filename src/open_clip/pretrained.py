@@ -455,36 +455,16 @@ _PRETRAINED = {
             hf_hub='timm/eva_giant_patch14_plus_clip_224.merged2b_s11b_b114k/'
         ),
     ),
-    'EVA02-B-16': dict(
+    'EVA02': dict(
         # from QuanSun/EVA-CLIP/EVA02_CLIP_B_psz16_s8B.pt
-        merged2b_s8b_b131k=_pcfg(
+        base_merged2b_s8b_b131k=_pcfg(
             hf_hub='timm/eva02_base_patch16_clip_224.merged2b_s8b_b131k/'
         ),
-        eva02=_pcfg(hf_hub='QuanSun/EVA-CLIP/EVA02_B_psz14to16.pt'),
-    ),
-    'EVA02-L-14': dict(
-        # from QuanSun/EVA-CLIP/EVA02_CLIP_L_psz14_s4B.pt
-        merged2b_s4b_b131k=_pcfg(
+        large_merged2b_s4b_b131k=_pcfg(
             hf_hub='timm/eva02_large_patch14_clip_224.merged2b_s4b_b131k/'
         ),
-    ),
-    'EVA02-L-14-336': dict(
-        # from QuanSun/EVA-CLIP/EVA02_CLIP_L_336_psz14_s6B.pt
-        merged2b_s6b_b61k=_pcfg(
-            hf_hub='timm/eva02_large_patch14_clip_336.merged2b_s6b_b61k/'
-        ),
-    ),
-    'EVA02-E-14': dict(
-        # from QuanSun/EVA-CLIP/EVA02_CLIP_E_psz14_s4B.pt
-        laion2b_s4b_b115k=_pcfg(
-            hf_hub='timm/eva02_enormous_patch14_clip_224.laion2b_s4b_b115k/'
-        ),
-    ),
-    'EVA02-E-14-plus': dict(
-        # from QuanSun/EVA-CLIP/EVA02_CLIP_E_psz14_plus_s9B.pt
-        laion2b_s9b_b144k=_pcfg(
-            hf_hub='timm/eva02_enormous_patch14_plus_clip_224.laion2b_s9b_b144k/'
-        ),
+        B16=_pcfg(hf_hub='QuanSun/EVA-CLIP/EVA02_B_psz14to16.pt'),
+        L14=_pcfg(hf_hub='QuanSun/EVA-CLIP/EVA02_L_psz14.pt'),
     ),
     'ViT-B-16-SigLIP': dict(
         webli=_slpcfg(hf_hub='timm/ViT-B-16-SigLIP/'),

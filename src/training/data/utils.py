@@ -1,26 +1,40 @@
 import csv
 import gzip
 import json
-import logging
 import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from types import MappingProxyType
+from typing import Dict, List, Optional, Tuple
 
 import boto3
 import torch
 from aiohttp import ClientError
+from loguru import logger
 from torch.distributed import get_rank as torch_get_rank
+from training.distributed import is_using_distributed
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
     BatchEncoding,
 )
 
-from training.distributed import is_using_distributed
-
-
 s3_client = boto3.client('s3', region_name='eu-central-1')
+
+
+INSTRUCTION_CONFIG = MappingProxyType(
+    {
+        '': ('', ''),
+        'retrieval': ('Query: ', 'Document for retrieval: '),
+        'sts': ('Statement for clustering: ', 'Statement for clustering: '),
+        'reranking': ('Query: ', 'Document for reranking: '),
+        'clustering': ('Statement for clustering: ', 'Statement for clustering: '),
+        'classification': (
+            'Statement for classification: ',
+            'Statement for classification: ',
+        ),
+    }
+)
 
 
 def get_rank(group=None):
@@ -29,12 +43,12 @@ def get_rank(group=None):
     return 0
 
 
-def log_on_rank(message: str):
+def log_on_rank(message):
     try:
         rank = get_rank()
-        logging.debug(f'[rank={rank}]{message}')
+        logger.debug(f'[rank={rank}]{message}')
     except RuntimeError:
-        logging.debug(message)
+        logger.debug(message)
 
 
 class SimLMCrossEncoder:
@@ -55,7 +69,7 @@ class SimLMCrossEncoder:
         self._model.eval()
         self._model.to(self._device)
 
-    def predict(self, sentences: list[list[str]]) -> BatchEncoding:
+    def predict(self, sentences: List[List[str]]) -> BatchEncoding:
         query, target = zip(*sentences)
         target = [f'-: {x}' for x in target]
         features = self._tokenizer(
@@ -125,11 +139,11 @@ def get_dataset_info(bucket_name, directory: Optional[str] = None):
         )
         datasets = []
         for out in result.get('CommonPrefixes'):
-            datasets.append(out.get('Prefix')[len(directory) + 1: -1])
+            datasets.append(out.get('Prefix')[len(directory) + 1 : -1])
     # try to get size info
     try:
         tags = get_tags(bucket_name, directory)
-    except Exception:
+    except Exception as _:
         log_on_rank(f'Could not retrieve size values for {bucket_name}/{directory}')
         tags = {}
     dataset_dict = {}
@@ -205,3 +219,19 @@ def lookahead(f):
         return result
 
     return g
+
+
+def add_instruction(
+    texts,
+    task_type: Optional[str],
+    instruction_config: Dict[str, Tuple[str]] = INSTRUCTION_CONFIG,
+):
+    if task_type is None:
+        task_type = ''
+    first_prefix = instruction_config[task_type][0]
+    remaining_prefixes = instruction_config[task_type][1]
+    if len(texts) < 1:
+        raise ValueError('Texts must contain at least one element')
+    return [f'{first_prefix}{texts[0]}'] + [
+        f'{remaining_prefixes}{text}' for text in texts[1:]
+    ]

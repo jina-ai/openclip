@@ -200,6 +200,10 @@ dataset_collection = {
 }
 
 
+class LanguageNotSupportedError(Exception):
+    pass
+
+
 def build_dataset(
     dataset_name: str,
     root: str = 'root',
@@ -380,9 +384,10 @@ def build_dataset(
         classnames = json.load(
             open(os.path.join(current_folder, 'babel_imagenet.json'))
         )
-        assert (
-            language.upper() in classnames
-        ), f"Language '{language}' not supported for Babel-ImageNet"
+        if language.upper() not in classnames:
+            raise LanguageNotSupportedError(
+                f"Language '{language}' not supported for Babel-ImageNet"
+            )
         classnames = classnames[language.upper()]
         templates = json.load(
             open(os.path.join(current_folder, 'nllb_dist13b_prompts.json'))
@@ -1227,7 +1232,9 @@ def build_dataset(
         from clip_benchmark.datasets import multilingual_mscoco
 
         if language not in multilingual_mscoco.SUPPORTED_LANGUAGES:
-            raise ValueError('Unsupported language for multilingual_ms_coco:', language)
+            raise LanguageNotSupportedError(
+                f'Unsupported language for multilingual_ms_coco: {language}'
+            )
         annotation_file = os.path.join(
             root, multilingual_mscoco.OUTPUT_FILENAME_TEMPLATE.format(language)
         )
@@ -1241,7 +1248,9 @@ def build_dataset(
         from clip_benchmark.datasets import crossmodal3600
 
         if language not in crossmodal3600.SUPPORTED_LANGUAGES:
-            raise ValueError('Unsupported language for Crossmodal-3600:', language)
+            raise LanguageNotSupportedError(
+                f'Unsupported language for Crossmodal-3600: {language}'
+            )
         annotation_file = os.path.join(
             root, crossmodal3600.OUTPUT_FILENAME_TEMPLATE.format(language)
         )
@@ -1255,7 +1264,9 @@ def build_dataset(
         from clip_benchmark.datasets import xtd200
 
         if language not in xtd200.SUPPORTED_LANGUAGES:
-            raise ValueError('Unsupported language for xtd200:', language)
+            raise LanguageNotSupportedError(
+                f'Unsupported language for xtd200: {language}'
+            )
         annotation_file = os.path.join(
             root, xtd200.OUTPUT_FILENAME_TEMPLATE.format(language)
         )
@@ -1269,7 +1280,9 @@ def build_dataset(
         from clip_benchmark.datasets import flickr30k_200
 
         if language not in flickr30k_200.SUPPORTED_LANGUAGES:
-            raise ValueError('Unsupported language for flickr30k-200:', language)
+            raise LanguageNotSupportedError(
+                f'Unsupported language for flickr30k-200: {language}'
+            )
         annotation_file = os.path.join(
             root, flickr30k_200.OUTPUT_FILENAME_TEMPLATE.format(language)
         )
@@ -1317,7 +1330,7 @@ def build_dataset(
             elif language == 'zh':
                 annotation_file = f'{root}/flickr30k_{split}_zh.txt'
             else:
-                raise ValueError(
+                raise LanguageNotSupportedError(
                     f'Unsupported language {language} for `{dataset_name}`'
                 )
         if not os.path.exists(annotation_file):
@@ -1341,7 +1354,7 @@ def build_dataset(
                     shell=True,
                 )
             else:
-                raise ValueError(
+                raise LanguageNotSupportedError(
                     f'Unsupported language {language} for `{dataset_name}`'
                 )
         ds = flickr.Flickr(
@@ -1377,7 +1390,7 @@ def build_dataset(
             elif language == 'zh':
                 annotation_file = f'{root}/flickr8k_{split}_zh.txt'
             else:
-                raise ValueError(
+                raise LanguageNotSupportedError(
                     f'Unsupported language {language} for `{dataset_name}`'
                 )
         if not os.path.exists(annotation_file):
@@ -1401,7 +1414,7 @@ def build_dataset(
                     shell=True,
                 )
             else:
-                raise ValueError(
+                raise LanguageNotSupportedError(
                     f'Unsupported language {language} for `{dataset_name}`'
                 )
         ds = flickr.Flickr(

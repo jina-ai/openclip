@@ -18,7 +18,6 @@ def _assign_lrs(
 def _map_param_groups_to_lrs(
     optimizer: optim.Optimizer, baselr: float
 ) -> tuple[dict[int, int], dict[int, float]]:
-
     _lr_counter = 0
     lrs2ids = {}
     groups2lrids = {}
@@ -54,7 +53,6 @@ def _constant_lr_with_cooldown(
     cooldown_power: float = 1.0,
     cooldown_end_lr: float = 0.0,
 ) -> float:
-
     start_cooldown_step = total_steps - cooldown_steps
     if step < warmup_steps:
         return _warmup_lr(baselr, step, warmup_steps)
@@ -93,7 +91,8 @@ def create_scheduler(
         )
     elif scheduler_type == 'const':
         _f_scheduler = partial(
-            _constant_lr, warmup_steps=warmup_steps,
+            _constant_lr,
+            warmup_steps=warmup_steps,
         )
     elif scheduler_type == 'const-cooldown':
         assert cooldown_steps is not None
@@ -114,8 +113,7 @@ def create_scheduler(
 
     groups2lrids, lrids2lrs = _map_param_groups_to_lrs(optimizer, baselr=baselr)
     _lr_scheduler_funcs = {
-        _id: partial(_f_scheduler, baselr=lr)
-        for _id, lr in lrids2lrs.items()
+        _id: partial(_f_scheduler, baselr=lr) for _id, lr in lrids2lrs.items()
     }
 
     def _lr_scheduler(step: int):

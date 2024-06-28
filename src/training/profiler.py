@@ -170,9 +170,7 @@ def profile_model(model_name, batch_size=1, profiler='torch'):
     if hasattr(model, 'context_length') and model.context_length:
         text_input_size = (model.context_length,)
 
-    results = {}
-    results['model'] = model_name
-    results['image_size'] = image_input_size[1]
+    results = {'model': model_name, 'image_size': image_input_size[1]}
 
     model_cfg = open_clip.get_model_config(model_name)
     if model_cfg:

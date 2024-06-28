@@ -3,6 +3,7 @@ Code adapted from https://github.com/pytorch/vision/blob/main/torchvision/datase
 Modification of caltech101 from torchvision where the background class is not removed
 Thanks to the authors of torchvision
 """
+
 import os
 import os.path
 from glob import glob

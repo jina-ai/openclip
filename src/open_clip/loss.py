@@ -18,7 +18,6 @@ except ImportError:
 
 
 class GatherFeatures:
-
     def __init__(
         self,
         local_loss: bool = False,
@@ -74,7 +73,6 @@ class GatherFeatures:
         return all_features
 
 
-
 def gather_features(
     image_features,
     text_features,
@@ -95,7 +93,7 @@ def gather_features(
     return (
         gather(image_features),
         gather(text_features),
-        gather(teacher_features) if teacher_features else None
+        gather(teacher_features) if teacher_features else None,
     )
 
 

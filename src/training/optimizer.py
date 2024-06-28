@@ -29,6 +29,10 @@ def create_optimizer(args, model: nn.Module, dsinit=None):
     _text_counter = 0
     _vision_lr = args.lr
     _vision_counter = 0
+    _text_llr_decay = (
+        args.text_llr_decay if args.text_llr_decay is not None else args.llr_decay
+    )
+    _vision_llr_decay = args.llr_decay
 
     for name, param in reversed(list(model.named_parameters())):
         if param.requires_grad:
@@ -39,12 +43,12 @@ def create_optimizer(args, model: nn.Module, dsinit=None):
             if is_text_module(name):
                 lr = _text_lr
                 descriptor = f'type=text|depth={_text_counter}|name={name}|'
-                _text_lr *= args.text_lr_decay
+                _text_lr *= _text_llr_decay
                 _text_counter += 1
             elif is_vision_module(name):
                 lr = _vision_lr
                 descriptor = f'type=vision|depth={_vision_counter}|name={name}|'
-                _vision_lr *= args.vision_lr_decay
+                _vision_lr *= _vision_llr_decay
                 _vision_counter += 1
 
             params.append(
@@ -72,7 +76,7 @@ def create_optimizer(args, model: nn.Module, dsinit=None):
             except ModuleNotFoundError or ImportError:
                 raise ModuleNotFoundError(
                     'DeepSpeed is required in order to use the LAMB optimizer, use '
-                    '\'pip install deepspeed\' to install'
+                    "'pip install deepspeed' to install"
                 )
             optimizer = FusedLamb(
                 params=params, betas=(args.beta1, args.beta2), eps=args.eps
@@ -96,6 +100,7 @@ def create_optimizer(args, model: nn.Module, dsinit=None):
 
         if args.precision == 'amp':
             from torch.cuda.amp import GradScaler
+
             scaler = GradScaler()
         else:
             scaler = None

@@ -2,6 +2,7 @@
 Adapted from https://github.com/pytorch/vision/blob/main/torchvision/datasets/flickr.py
 Thanks to the authors of torchvision
 """
+
 import os
 from collections import defaultdict
 from typing import Any, Callable, Optional, Tuple

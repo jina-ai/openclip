@@ -21,9 +21,8 @@ from open_clip import (
     get_input_dtype,
     get_tokenizer,
 )
-
 from training.distributed import is_master
-from training.precision import get_autocast
+from training.utils import get_autocast
 
 MTEB_LOGGING_METRICS = ['ndcg_at_10', 'cos_sim']
 
@@ -33,7 +32,7 @@ def _get_clip_metrics(image_features, text_features, logit_scale):
     logits_per_image = (logit_scale * image_features @ text_features.t()).detach().cpu()
     logits_per_text = logits_per_image.t().detach().cpu()
 
-    logits = {'image-to-text': logits_per_image, 'text-to-image': logits_per_text}
+    logits = {'image2text': logits_per_image, 'text2image': logits_per_text}
     ground_truth = torch.arange(len(text_features)).view(-1, 1)
 
     for name, logit in logits.items():
@@ -56,11 +55,11 @@ def _maybe_compute_generative_loss(model_out):
 
 
 def _run_validation(model, data, epoch, args):
-    if 'val' not in data:
-        return {}
-    if args.val_frequency == 0:
-        return {}
-    if (epoch % args.val_frequency) != 0 and epoch != args.epochs:
+    if (
+        'val' not in data
+        or args.val_frequency == 0
+        or ((epoch % args.val_frequency) != 0 and epoch != args.epochs)
+    ):
         return {}
 
     logging.info('--------------------------------------------------------------------')
@@ -77,8 +76,8 @@ def _run_validation(model, data, epoch, args):
     # FIXME this does not scale past small eval datasets
     # all_image_features @ all_text_features will blow up memory and compute
     # very quickly
-    cumulative_loss = 0.0
-    cumulative_gen_loss = 0.0
+    cumulative_loss: torch.Tensor = torch.tensor([0.0])
+    cumulative_gen_loss: torch.Tensor = torch.tensor([0.0])
     all_image_features, all_text_features = [], []
 
     metrics = {}
@@ -112,21 +111,20 @@ def _run_validation(model, data, epoch, args):
                     f.cross_entropy(logits_per_image, labels)
                     + f.cross_entropy(logits_per_text, labels)
                 ) / 2
-
                 gen_loss = _maybe_compute_generative_loss(model_out)
 
             cumulative_loss += total_loss * batch_size
             num_samples += batch_size
             if is_master(args) and (i % 100) == 0:
                 logging.info(
-                    f'Eval Epoch: {epoch} [{num_samples} / {samples_per_val}]\t'
-                    f'Clip Loss: {cumulative_loss / num_samples:.6f}\t'
+                    f'Eval epoch: {epoch} [{num_samples} / {samples_per_val}]\t'
+                    f'Clip loss: {cumulative_loss / num_samples:.6f}\t'
                 )
 
                 if gen_loss is not None:
                     cumulative_gen_loss += gen_loss * batch_size
                     logging.info(
-                        f'Generative Loss: '
+                        f'Generative loss: '
                         f'{cumulative_gen_loss / num_samples:.6f}\t'
                     )
 
@@ -138,17 +136,10 @@ def _run_validation(model, data, epoch, args):
             logit_scale=logit_scale.cpu(),
         )
         loss = cumulative_loss / num_samples
-        metrics.update(
-            {
-                **val_metrics,
-                'clip_loss': loss.item(),
-                'epoch': epoch,
-                'num_samples': num_samples,
-            }
-        )
+        metrics.update({**val_metrics, 'clip-loss': loss.item()})
         if gen_loss is not None:
             gen_loss = cumulative_gen_loss / num_samples
-            metrics.update({'generative_loss': gen_loss.item()})
+            metrics.update({'generative-loss': gen_loss.item()})
 
     logging.info('Finished!')
     logging.info('--------------------------------------------------------------------')
@@ -195,17 +186,18 @@ def _run_classifier(model, classifier, dataloader, args):
 
 
 def _run_zeroshot_evaluation(model, data, epoch, args, tokenizer=None):
-    if 'imagenet-val' not in data and 'imagenet-v2' not in data:
+    if (
+        ('imagenet-val' not in data and 'imagenet-v2' not in data)
+        or args.zeroshot_frequency == 0
+        or ((epoch % args.zeroshot_frequency) != 0 and epoch != args.epochs)
+    ):
         return {}
-    if args.zeroshot_frequency == 0:
-        return {}
-    if (epoch % args.zeroshot_frequency) != 0 and epoch != args.epochs:
-        return {}
+
     if args.distributed and not args.horovod:
         model = model.module
 
     logging.info('--------------------------------------------------------------------')
-    logging.info('Starting zero-shot evaluation on Imagenet ...')
+    logging.info('Starting zero-shot evaluation on ImageNet ...')
     if tokenizer is None:
         tokenizer = get_tokenizer(args.model)
 
@@ -244,9 +236,9 @@ def _run_zeroshot_evaluation(model, data, epoch, args, tokenizer=None):
 
 
 def _run_clip_benchmark(model, tokenizer, transform, epoch, args):
-    if args.clip_benchmark_frequency == 0:
-        return {}
-    if (epoch % args.clip_benchmark_frequency) != 0 and epoch != args.epochs:
+    if args.clip_benchmark_frequency == 0 or (
+        (epoch % args.clip_benchmark_frequency) != 0 and epoch != args.epochs
+    ):
         return {}
 
     logging.info('--------------------------------------------------------------------')
@@ -263,6 +255,7 @@ def _run_clip_benchmark(model, tokenizer, transform, epoch, args):
     with autocast():
         results = run_benchmark(
             datasets=[t for t in args.clip_benchmark_datasets.split(',')],
+            languages=[lang for lang in args.clip_benchmark_languages.split(',')],
             models=[
                 CLIPBenchmarkModel(
                     name=args.model,
@@ -291,9 +284,9 @@ def _run_clip_benchmark(model, tokenizer, transform, epoch, args):
 
 
 def _run_mteb_benchmark(model, tokenizer, epoch, args):
-    if args.mteb_frequency == 0:
-        return {}
-    if (epoch % args.mteb_frequency) != 0 and epoch != args.epochs:
+    if args.mteb_frequency == 0 or (
+        (epoch % args.mteb_frequency) != 0 and epoch != args.epochs
+    ):
         return {}
 
     logging.info('--------------------------------------------------------------------')
@@ -404,7 +397,7 @@ def _run_mteb_benchmark(model, tokenizer, epoch, args):
     autocast = get_autocast(args.precision)
     with autocast():
         for task in args.mteb_tasks.split(','):
-            evaluation = MTEB(tasks=[task], task_langs=['en'])
+            evaluation = MTEB(tasks=[task], task_langs=args.mteb_languages.split(','))
             results = evaluation.run(
                 _mteb_model,
                 batch_size=16,
@@ -455,7 +448,7 @@ def evaluate(
     clip_benchmark_metrics = _run_clip_benchmark(
         model, tokenizer, transform, epoch, args
     )
-    metrics.update({f'clipbenchmark-{k}': v for k, v in clip_benchmark_metrics.items()})
+    metrics.update({f'clipb-{k}': v for k, v in clip_benchmark_metrics.items()})
 
     mteb_metrics = _run_mteb_benchmark(model, tokenizer, epoch, args)
     metrics.update({f'mteb-{k}': v for k, v in mteb_metrics.items()})
@@ -464,10 +457,9 @@ def evaluate(
         return {}
 
     logging.info(
-        f'Eval Epoch: {epoch} '
+        f'Eval epoch: {epoch} '
         + '\t'.join([f'{k}: {round(v, 4):.4f}' for k, v in metrics.items()])
     )
-
     logdata = {'val/' + name: val for name, val in metrics.items()}
 
     if args.save_logs:

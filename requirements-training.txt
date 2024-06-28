@@ -13,3 +13,4 @@ fsspec
 bitsandbytes
 boto3==1.28.71
 pytorch_metric_learning==2.2.0
+loguru

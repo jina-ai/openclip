@@ -1,6 +1,7 @@
 import json
 import os
 from datetime import timedelta
+from typing import Tuple
 
 import torch
 import torch.distributed as dist
@@ -11,21 +12,21 @@ except ImportError:
     hvd = None
 
 
-def is_global_master(args):
+def is_global_master(args) -> bool:
     return args.rank == 0
 
 
-def is_local_master(args):
+def is_local_master(args) -> bool:
     return args.local_rank == 0
 
 
-def is_master(args, local=False):
+def is_master(args, local: bool = False) -> bool:
     return is_local_master(args) if local else is_global_master(args)
 
 
-def is_using_horovod():
+def is_using_horovod() -> bool:
     # NOTE w/ horovod run, OMPI vars should be set, but w/ SLURM PMI vars will be set
-    # Differentiating between horovod and DDP use via SLURM may not be possible, so 
+    # Differentiating between horovod and DDP use via SLURM may not be possible, so
     # horovod arg still required...
     ompi_vars = ['OMPI_COMM_WORLD_RANK', 'OMPI_COMM_WORLD_SIZE']
     pmi_vars = ['PMI_RANK', 'PMI_SIZE']
@@ -37,7 +38,7 @@ def is_using_horovod():
         return False
 
 
-def is_using_distributed():
+def is_using_distributed() -> bool:
     if 'WORLD_SIZE' in os.environ:
         return int(os.environ['WORLD_SIZE']) > 1
     if 'SLURM_NTASKS' in os.environ:
@@ -45,7 +46,7 @@ def is_using_distributed():
     return False
 
 
-def world_info_from_env():
+def world_info_from_env() -> Tuple[int, int, int]:
     local_rank = 0
     for v in (
         'LOCAL_RANK',
@@ -97,12 +98,9 @@ def init_distributed_device(args):
                 'type': 'Lamb',
                 'params': {
                     'bias_correction': True,
-                    'betas': [
-                        args.beta1,
-                        args.beta2
-                    ],
-                    'eps': args.eps
-                }
+                    'betas': [args.beta1, args.beta2],
+                    'eps': args.eps,
+                },
             }
         else:
             optimizer = {
@@ -110,18 +108,15 @@ def init_distributed_device(args):
                 'adam_w_mode': True,
                 'params': {
                     'bias_correction': True,
-                    'betas': [
-                        args.beta1,
-                        args.beta2
-                    ],
-                    'eps': args.eps
-                }
+                    'betas': [args.beta1, args.beta2],
+                    'eps': args.eps,
+                },
             }
 
         with open(args.deepspeed_config, 'w') as f:
             dsconfig = {
                 'train_batch_size': (
-                    args.batch_size * args. world_size * args.accum_freq
+                    args.batch_size * args.world_size * args.accum_freq
                 ),
                 'train_micro_batch_size_per_gpu': args.batch_size,
                 'gradient_accumulation_steps': args.accum_freq,
@@ -134,28 +129,18 @@ def init_distributed_device(args):
                     'initial_scale_power': 16,
                     'loss_scale_window': 1000,
                     'hysteresis': 2,
-                    'min_loss_scale': 1
+                    'min_loss_scale': 1,
                 },
                 'bf16': {
                     'enabled': args.precision == 'bf16' or args.precision == 'bfloat16',
                 },
-                'amp': {
-                    'enabled': args.precision == 'amp',
-                    'opt_level': 'O2'
-                },
-                # 'flops_profiler': {
-                #     'enabled': True,
-                #     'profile_step': -1,
-                #     'module_depth': -1,
-                #     'top_modules': 1,
-                #     'detailed': True,
-                # },
+                'amp': {'enabled': args.precision == 'amp', 'opt_level': 'O2'},
                 'comms_logger': {
                     'enabled': True,
                     'verbose': False,
                     'prof_all': True,
-                    'debug': False
-                }
+                    'debug': False,
+                },
             }
 
             if args.grad_clip_norm is not None:
@@ -186,18 +171,15 @@ def init_distributed_device(args):
                     'stage3_prefetch_bucket_size': 1e7,
                     'stage3_param_persistence_threshold': 1e5,
                     'sub_group_size': 1e9,
-                    'offload_optimizer': {
-                        'device': 'cpu'
-                    },
-                    'offload_param': {
-                        'device': 'cpu'
-                    },
+                    'offload_optimizer': {'device': 'cpu'},
+                    'offload_param': {'device': 'cpu'},
                     'allgather_bucket_size': args.zero_bucket_size,
                     'reduce_bucket_size': args.zero_bucket_size,
                 }
             dsconfig['zero_optimization'] = zero_optimization
 
             f.write(json.dumps(dsconfig, indent=2))
+
     elif is_using_distributed():
         if 'SLURM_PROCID' in os.environ:
             # DDP via SLURM
@@ -233,12 +215,13 @@ def init_distributed_device(args):
         torch.cuda.set_device(device)
     else:
         device = 'cpu'
+
     args.device = device
     device = torch.device(device)
     return device
 
 
-def broadcast_object(args, obj, src=0):
+def broadcast_object(args, obj, src: int = 0):
     # broadcast a pickle-able python object from rank-0 to all ranks
     if args.horovod:
         return hvd.broadcast_object(obj, root_rank=src)
@@ -251,7 +234,7 @@ def broadcast_object(args, obj, src=0):
         return objects[0]
 
 
-def all_gather_object(args, obj, dst=0):
+def all_gather_object(args, obj):
     # gather a pickle-able python object across all ranks
     if args.horovod:
         return hvd.allgather_object(obj)

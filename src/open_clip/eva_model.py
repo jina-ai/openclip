@@ -1,6 +1,8 @@
 # --------------------------------------------------------
-# Adapted from  https://github.com/microsoft/unilm/tree/master/beit
+# Adapted from EVA CLIP
+# https://github.com/baaivision/EVA/tree/master/EVA-CLIP/rei/eva_clip
 # --------------------------------------------------------
+
 import math
 import os
 from functools import partial
@@ -14,8 +16,7 @@ try:
 except ImportError or ModuleNotFoundError:
     from timm.layers import drop_path, to_2tuple, trunc_normal_
 
-from .rope import VisionRotaryEmbeddingFast
-from .transformer import PatchDropout
+from .rope_embeddings import VisionRotaryEmbeddingFast
 
 if os.getenv('ENV_TYPE') == 'deepspeed':
     try:
@@ -29,11 +30,51 @@ try:
     import xformers.ops as xops
 except ImportError:
     xops = None
-    print("Please 'pip install xformers'")
+
+
+class PatchDropout(nn.Module):
+    """
+    https://arxiv.org/abs/2212.00794
+    """
+
+    def __init__(self, prob, exclude_first_token=True):
+        super().__init__()
+        assert 0 <= prob < 1.0
+        self.prob = prob
+        self.exclude_first_token = exclude_first_token  # exclude CLS token
+
+    def forward(self, x):
+        if not self.training or self.prob == 0.0:
+            return x
+
+        if self.exclude_first_token:
+            cls_tokens, x = x[:, :1], x[:, 1:]
+        else:
+            cls_tokens = torch.jit.annotate(torch.Tensor, x[:, :1])
+
+        batch = x.size()[0]
+        num_tokens = x.size()[1]
+
+        batch_indices = torch.arange(batch)
+        batch_indices = batch_indices[..., None]
+
+        keep_prob = 1 - self.prob
+        num_patches_keep = max(1, int(num_tokens * keep_prob))
+
+        rand = torch.randn(batch, num_tokens)
+        patch_indices_keep = rand.topk(num_patches_keep, dim=-1).indices
+
+        x = x[batch_indices, patch_indices_keep]
+
+        if self.exclude_first_token:
+            x = torch.cat((cls_tokens, x), dim=1)
+
+        return x, patch_indices_keep
 
 
 class DropPath(nn.Module):
-    """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks)."""
+    """Drop paths (Stochastic Depth) per sample  (when applied in main path of
+    residual blocks)."""
 
     def __init__(self, drop_prob=None):
         super(DropPath, self).__init__()
@@ -242,6 +283,10 @@ class Attention(nn.Module):
             k = torch.cat((k[:, :, :1, :], ro_k_t), -2).type_as(v)
 
         if self.xattn:
+            if xops is None:
+                raise ValueError(
+                    "Can't use xattn without xformers. Please 'pip install xformers'"
+                )
             q = q.permute(0, 2, 1, 3)  # B, num_heads, N, C -> B, N, num_heads, C
             k = k.permute(0, 2, 1, 3)
             v = v.permute(0, 2, 1, 3)
@@ -329,7 +374,8 @@ class Block(nn.Module):
             subln=subln,
             norm_layer=norm_layer,
         )
-        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
+        # NOTE: drop path for stochastic depth, we shall see if this is better
+        # than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
@@ -352,10 +398,10 @@ class Block(nn.Module):
 
         if init_values is not None and init_values > 0:
             self.gamma_1 = nn.Parameter(
-                init_values * torch.ones((dim)), requires_grad=True
+                init_values * torch.ones((dim,)), requires_grad=True
             )
             self.gamma_2 = nn.Parameter(
-                init_values * torch.ones((dim)), requires_grad=True
+                init_values * torch.ones((dim,)), requires_grad=True
             )
         else:
             self.gamma_1, self.gamma_2 = None, None
@@ -418,9 +464,10 @@ class PatchEmbed(nn.Module):
     def forward(self, x, **kwargs):
         B, C, H, W = x.shape
         # FIXME look at relaxing size constraints
-        assert (
-            H == self.img_size[0] and W == self.img_size[1]
-        ), f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
+        assert H == self.img_size[0] and W == self.img_size[1], (
+            f"Input image size ({H}*{W}) doesn't match model "
+            f'({self.img_size[0]}*{self.img_size[1]}).'
+        )
         x = self.proj(x).flatten(2).transpose(1, 2)
         return x
 
@@ -511,9 +558,9 @@ class EVAVisionTransformer(nn.Module):
         super().__init__()
         self.image_size = img_size
         self.num_classes = num_classes
-        self.num_features = (
-            self.embed_dim
-        ) = embed_dim  # num_features for consistency with other models
+        self.num_features = self.embed_dim = (
+            embed_dim  # num_features for consistency with other models
+        )
 
         self.patch_embed = PatchEmbed(
             img_size=img_size,
@@ -609,7 +656,8 @@ class EVAVisionTransformer(nn.Module):
             if qkv_bias:
                 self.head.bias.data.mul_(init_scale)
 
-        # setting a patch_dropout of 0. would mean it is disabled and this function would be the identity fn
+        # setting a patch_dropout of 0. would mean it is disabled and this function
+        # would be the identity fn
         self.patch_dropout = (
             PatchDropout(patch_dropout) if patch_dropout > 0.0 else nn.Identity()
         )
@@ -678,7 +726,8 @@ class EVAVisionTransformer(nn.Module):
             x = x + self.pos_embed
         x = self.pos_drop(x)
 
-        # a patch_dropout of 0. would mean it is disabled and this function would do nothing but return what was passed in
+        # a patch_dropout of 0. would mean it is disabled and this function would do
+        # nothing but return what was passed in
         if self.rope is not None:
             if self.training and not isinstance(self.patch_dropout, nn.Identity):
                 x, patch_indices_keep = self.patch_dropout(x)

@@ -1,11 +1,15 @@
 import os
 import random
 from itertools import product
-from typing import Any, Optional, Union
+from typing import Any, List, Optional, Union
 
 from training.distributed import world_info_from_env
 
-from clip_benchmark.dataset import dataset_collection, get_dataset_collection_from_file
+from clip_benchmark.dataset import (
+    LanguageNotSupportedError,
+    dataset_collection,
+    get_dataset_collection_from_file,
+)
 from clip_benchmark.evaluate import CLIPBenchmarkModel, run_evaluation_task
 from clip_benchmark.models import model_collection
 
@@ -38,7 +42,7 @@ def run_benchmark(
     models: Union[str, CLIPBenchmarkModel, list[str], list[CLIPBenchmarkModel]],
     task: str = 'auto',
     output: Optional[str] = None,
-    language: str = 'en',
+    languages: Union[str, List[str]] = 'en',
     dataset_root: str = 'root',
     feature_root: str = 'features',
     batch_size: int = 64,
@@ -142,7 +146,7 @@ def run_benchmark(
             ),
         }
 
-    languages = _as_list(language)
+    languages = _as_list(languages)
 
     print(f'Models: {[model.name for model in _models]}')
     print(f'Datasets: {_datasets}')
@@ -168,41 +172,51 @@ def run_benchmark(
         )
         print('-----------------------------------------------------------------------')
 
-        metrics = run_evaluation_task(
-            model=model,
-            dataset=dataset,
-            task=task,
-            output=output,
-            language=language,
-            dataset_root=dataset_root,
-            feature_root=feature_root,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            seed=seed,
-            amp=amp,
-            distributed=distributed,
-            skip_existing=skip_existing,
-            recall_ks=recall_ks,
-            save_clf=save_clf,
-            load_clfs=load_clfs,
-            annotation_file=annotation_file,
-            custom_template_file=custom_template_file,
-            custom_classname_file=custom_classname_file,
-            dump_classnames=dump_classnames,
-            dump_templates=dump_templates,
-            model_cache_dir=model_cache_dir,
-            wds_cache_dir=wds_cache_dir,
-            normalize=normalize,
-            split=split,
-            linear_probe_train_split=_dataset_info[dataset]['linear_probe_train_split'],
-            linear_probe_val_split=_dataset_info[dataset]['linear_probe_val_split'],
-            linear_probe_val_proportion=(
-                _dataset_info[dataset]['linear_probe_val_proportion']
-            ),
-            linear_probe_fewshot_k=linear_probe_fewshot_k,
-            linear_probe_fewshot_lr=linear_probe_fewshot_lr,
-            linear_probe_fewshot_epochs=linear_probe_fewshot_epochs,
-        )
+        try:
+            metrics = run_evaluation_task(
+                model=model,
+                dataset=dataset,
+                task=task,
+                output=output,
+                language=language,
+                dataset_root=dataset_root,
+                feature_root=feature_root,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                seed=seed,
+                amp=amp,
+                distributed=distributed,
+                skip_existing=skip_existing,
+                recall_ks=recall_ks,
+                save_clf=save_clf,
+                load_clfs=load_clfs,
+                annotation_file=annotation_file,
+                custom_template_file=custom_template_file,
+                custom_classname_file=custom_classname_file,
+                dump_classnames=dump_classnames,
+                dump_templates=dump_templates,
+                model_cache_dir=model_cache_dir,
+                wds_cache_dir=wds_cache_dir,
+                normalize=normalize,
+                split=split,
+                linear_probe_train_split=(
+                    _dataset_info[dataset]['linear_probe_train_split']
+                ),
+                linear_probe_val_split=_dataset_info[dataset]['linear_probe_val_split'],
+                linear_probe_val_proportion=(
+                    _dataset_info[dataset]['linear_probe_val_proportion']
+                ),
+                linear_probe_fewshot_k=linear_probe_fewshot_k,
+                linear_probe_fewshot_lr=linear_probe_fewshot_lr,
+                linear_probe_fewshot_epochs=linear_probe_fewshot_epochs,
+            )
+        except LanguageNotSupportedError:
+            print(
+                f"Language '{language}' is not supported for dataset "
+                f"'{dataset}', skipping"
+            )
+            continue
+
         results.append(metrics)
 
     return results

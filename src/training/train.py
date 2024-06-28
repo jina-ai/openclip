@@ -6,7 +6,6 @@ from collections import defaultdict
 from itertools import islice
 
 import torch
-from torch import nn
 
 try:
     import wandb
@@ -14,10 +13,8 @@ except ImportError:
     wandb = None
 
 from open_clip import get_input_dtype
-from open_clip.loss import GatherFeatures
-
-from .distributed import is_master
-from .precision import get_autocast
+from training.distributed import is_master
+from training.utils import get_autocast
 
 
 class AverageMeter(object):
@@ -67,8 +64,7 @@ def backward(total_loss, model, scaler=None, deepspeed=False):
         total_loss.backward()
 
 
-class DummyEmbeddingsDataloader:
-
+class _DummyDataloader:
     def __iter__(self):
         return self
 
@@ -80,14 +76,13 @@ def train_one_epoch(
     model,
     data,
     loss,
+    mtl_losses,
     epoch,
     optimizer,
     scaler,
     scheduler,
-    dist_model,
+    distill_model,
     args,
-    emb_dataloader=None,
-    emb_losses=None,
     tb_writer=None,
 ):
     device = torch.device(args.device)
@@ -96,60 +91,65 @@ def train_one_epoch(
 
     model.train()
     if args.distill:
-        dist_model.eval()
-
-    if args.mtl:
-        assert emb_dataloader is not None
-        assert emb_losses is not None
-    else:
-        emb_dataloader = DummyEmbeddingsDataloader()
+        distill_model.eval()
 
     # set epoch in process safe manner via sampler or shared_epoch
     data['train'].set_epoch(epoch)
-    dataloader = data['train'].dataloader
-    num_batches_per_epoch = dataloader.num_batches // args.accum_freq
-    sample_digits = math.ceil(math.log(dataloader.num_samples + 1, 10))
+    train_dataloader = data['train'].dataloader
+
+    train_s3_dataloader = data['train-s3'] or _DummyDataloader()
+    train_mtl_dataloader = data['train-mtl'] or _DummyDataloader()
+
+    _num_batches_per_epoch = train_dataloader.num_batches // args.accum_freq
+    _sample_digits = math.ceil(math.log(train_dataloader.num_samples + 1, 10))
 
     accum_images, accum_texts, accum_features = [], [], {}
-    accum_emb_datasets, accum_emb_batches, accum_emb_labels, accum_embeddings = (
-        [], [], [], []
+    accum_mtl_datasets, accum_mtl_batches, accum_mtl_labels, accum_mtl_features = (
+        [],
+        [],
+        [],
+        [],
     )
-
     losses_m = {}
-    batch_time_m = AverageMeter()
-    data_time_m = AverageMeter()
-    embeddings_gather = None
-    if args.emb_global_batch:
-        embeddings_gather = GatherFeatures(
-            local_loss=False,
-            gather_with_grad=args.gather_with_grad,
-            rank=args.rank,
-            world_size=args.world_size,
-        )
+    _batch_time_m = AverageMeter()
+    _data_time_m = AverageMeter()
 
     start = time.time()
 
     # training loop
-    for i, (mm_batch, (emb_dataset, (emb_batch, emb_labels))) in enumerate(zip(
-        dataloader, islice(emb_dataloader, 1, None)
-    )):
-
+    for i, (batch, (_, (s3batch, _), (mtldataset, (mtlbatch, mtllabels)))) in enumerate(
+        zip(
+            train_dataloader,
+            islice(train_s3_dataloader, 1, None),
+            islice(train_mtl_dataloader, 1, None),
+        )
+    ):
         i_accum = i // args.accum_freq
-        step = num_batches_per_epoch * epoch + i_accum
+        step = _num_batches_per_epoch * epoch + i_accum
 
         if not args.skip_scheduler:
             scheduler(step)
 
-        images, texts = mm_batch
+        images, texts = batch
         images = images.to(device=device, dtype=input_dtype, non_blocking=True)
         texts = texts.to(device=device, non_blocking=True)
-        if emb_batch:
-            for batch in emb_batch:
-                batch.to(device=device)
-        if emb_labels:
-            emb_labels[0] = [label.to(device=device) for label in emb_labels[0]]
+        alltexts = [texts]
+        batch_size = texts.shape[0]
+        s3_batch_size = 0
+        if s3batch:
+            for b in s3batch:
+                b.to(device=device)
+                alltexts.append(b['input_ids'])
+            s3_batch_size = s3batch[0].shape[0]
+        if mtlbatch:
+            for b in mtlbatch:
+                b.to(device=device)
+        if mtllabels:
+            mtllabels[0] = [label.to(device=device) for label in mtllabels[0]]
 
-        data_time_m.update(time.time() - start)
+        alltexts = torch.cat(alltexts, dim=0)
+
+        _data_time_m.update(time.time() - start)
 
         if args.deepspeed:
             model.zero_grad()
@@ -158,61 +158,78 @@ def train_one_epoch(
             optimizer.zero_grad()
 
         if args.accum_freq == 1:
-
             # WITHOUT Gradient Accumulation
 
             with autocast():
-
-                modelout = model(images, texts)
-                logit_scale = modelout['logit_scale']
+                modelout = model(images, alltexts)
                 if args.distill:
                     with torch.no_grad():
-                        dist_model_out = dist_model(images, texts)
+                        distill_model_out = distill_model(images, alltexts)
                     modelout.update(
-                        {f'dist_{k}': v for k, v in dist_model_out.items()}
+                        {f'distill_{k}': v for k, v in distill_model_out.items()}
                     )
-                losses = loss(**modelout, output_dict=True)
+                modelout['output_dict'] = True
+                image_features = modelout.pop('image_features')
+                text_features = modelout.pop('text_features')
+                left_features = torch.cat(
+                    [
+                        image_features,
+                        text_features[batch_size : batch_size + s3_batch_size,],
+                    ],
+                    dim=0,
+                )
+                right_features = torch.cat(
+                    [
+                        text_features[:batch_size],
+                        text_features[batch_size + s3_batch_size :,],
+                    ],
+                    dim=0,
+                )
+                losses = loss(left_features, right_features, **modelout)
 
-                if args.mtl:
-                    emb_loss_fn = (
-                        emb_losses[emb_dataset]
-                        if emb_dataset in emb_losses else emb_losses['*']
+                if mtl_losses is not None:
+                    mtllossfn = (
+                        mtl_losses[mtldataset]
+                        if mtldataset in mtl_losses
+                        else mtl_losses['*']
                     )
-                    embeddings = [
-                        model.module.encode_text(
-                            embedding['input_ids'], normalize=True
-                        )
-                        if isinstance(model, nn.parallel.DistributedDataParallel)
-                        else model.encode_text(
-                            embedding['input_ids'], normalize=True
-                        )
-                        for embedding in emb_batch
-                    ]
-                    if args.emb_global_batch:
-                        assert len(emb_labels) == 0, (
-                            'Global batch cannot be used in conjunction with labeled '
-                            'data'
-                        )
-                        all_embeddings = [embeddings_gather(emb) for emb in embeddings]
-                        embedding_loss = emb_loss_fn(*all_embeddings)
-                    else:
-                        embedding_loss = emb_loss_fn(*embeddings, *emb_labels)
-
-                    losses['embedding_loss'] = args.emb_loss_weight * embedding_loss
+                    modelouts = [model(None, b['input_ids']) for b in mtlbatch]
+                    mtlfeats = []
+                    for out in modelouts:
+                        mtlfeats.append(out.pop('text_features'))
+                        _ = out.pop('image_features')
+                    losskwargs = modelouts[0]
+                    losskwargs['output_dict'] = True
+                    mtlloss = mtllossfn(*mtlfeats, *mtllabels, **losskwargs)
+                    losses['mtl_loss'] = args.mtl_loss_weight * mtlloss
 
             total_loss = sum(losses.values())
             losses['loss'] = total_loss
             backward(total_loss, model, scaler=scaler, deepspeed=args.deepspeed)
 
         else:
-
             # WITH Gradient Accumulation
 
             # First, cache the features without any gradient tracking.
             with torch.no_grad():
                 with autocast():
-                    modelout = model(images, texts)
-
+                    modelout = model(images, alltexts)
+                    image_features = modelout.pop('image_features')
+                    text_features = modelout.pop('text_features')
+                    modelout['left_features'] = torch.cat(
+                        [
+                            image_features,
+                            text_features[batch_size : batch_size + s3_batch_size,],
+                        ],
+                        dim=0,
+                    )
+                    modelout['right_features'] = torch.cat(
+                        [
+                            text_features[:batch_size],
+                            text_features[batch_size + s3_batch_size :,],
+                        ],
+                        dim=0,
+                    )
                     for f in ('logit_scale', 'logit_bias'):
                         modelout.pop(f, None)
 
@@ -222,48 +239,42 @@ def train_one_epoch(
                         else:
                             accum_features[key] = [val]
 
-                    if args.mtl:
+                    if mtl_losses is not None:
                         # if we have no labels == pair training
-                        if len(emb_labels) == 0:
-                            embeddings = [
-                                model.module.encode_text(
-                                    embedding['input_ids'], normalize=True
-                                )
-                                if isinstance(model, nn.parallel.DistributedDataParallel)
-                                else model.encode_text(
-                                    embedding['input_ids'], normalize=True
-                                )
-                                for embedding in emb_batch
-                            ]
-                            accum_embeddings.append(embeddings)
+                        if len(mtllabels) == 0:
+                            modelouts = [model(None, b['input_ids']) for b in mtlbatch]
+                            mtlfeats = []
+                            for out in modelouts:
+                                mtlfeats.append(out.pop('text_features'))
+                            accum_mtl_features.append(mtlfeats)
                         # else == triplet training
                         else:
-                            accum_emb_labels.append(emb_labels)
+                            accum_mtl_labels.append(mtllabels)
 
                 accum_images.append(images)
-                accum_texts.append(texts)
+                accum_texts.append(alltexts)
                 if args.mtl:
-                    accum_emb_datasets.append(emb_dataset)
-                    accum_emb_batches.append(emb_batch)
+                    accum_mtl_datasets.append(mtldataset)
+                    accum_mtl_batches.append(mtlbatch)
 
             # If (i + 1) % accum_freq is not zero, move on to the next batch.
             if ((i + 1) % args.accum_freq) > 0:
                 # FIXME this makes data time logging unreliable when accumulating
                 continue
 
-            if len(accum_emb_labels) not in {0, args.accum_freq}:
+            if len(accum_mtl_labels) not in {0, args.accum_freq}:
                 warnings.warn(
                     f'Out of {args.accum_freq} gradient accumulation steps, '
-                    f'{len(accum_emb_labels)} contain labels and '
-                    f'{len(accum_embeddings)} are aligned pairs. '
+                    f'{len(accum_mtl_labels)} contain labels and '
+                    f'{len(accum_mtl_features)} are aligned pairs. '
                     f'Gradient accumulation cannot work with inconsistent data'
                 )
                 accum_images, accum_texts, accum_features = [], [], {}
                 (
-                    accum_emb_datasets,
-                    accum_emb_batches,
-                    accum_emb_labels,
-                    accum_embeddings
+                    accum_mtl_datasets,
+                    accum_mtl_batches,
+                    accum_mtl_labels,
+                    accum_mtl_features,
                 ) = [], [], [], []
                 continue
 
@@ -281,11 +292,27 @@ def train_one_epoch(
 
             for k in range(args.accum_freq):
                 with autocast():
-
                     images = accum_images[k]
-                    texts = accum_texts[k]
+                    alltexts = accum_texts[k]
 
-                    modelout = model(images, texts)
+                    modelout = model(images, alltexts)
+                    modelout['output_dict'] = True
+                    image_features = modelout.pop('image_features')
+                    text_features = modelout.pop('text_features')
+                    modelout['left_features'] = torch.cat(
+                        [
+                            image_features,
+                            text_features[batch_size : batch_size + s3_batch_size,],
+                        ],
+                        dim=0,
+                    )
+                    modelout['right_features'] = torch.cat(
+                        [
+                            text_features[:batch_size],
+                            text_features[batch_size + s3_batch_size :,],
+                        ],
+                        dim=0,
+                    )
 
                     inputs_no_accum = {}
                     inputs_no_accum['logit_scale'] = logit_scale = modelout.pop(
@@ -298,7 +325,7 @@ def train_one_epoch(
                     for key, val in accum_features.items():
                         accumulated = accum_features[key]
                         inputs[key] = torch.cat(
-                            accumulated[:k] + [modelout[key]] + accumulated[k+1:]
+                            accumulated[:k] + [modelout[key]] + accumulated[k + 1 :]
                         )
 
                     _losses = loss(**inputs, **inputs_no_accum, output_dict=True)
@@ -308,65 +335,57 @@ def train_one_epoch(
                     losses['contrastive_loss'] += contrastive_loss
                     total_loss = contrastive_loss
 
-                    if args.mtl:
-                        emb_dataset = accum_emb_datasets[k]
-                        emb_batch = accum_emb_batches[k]
-                        emb_loss_fn = (
-                            emb_losses[emb_dataset]
-                            if emb_dataset in emb_losses else emb_losses['*']
+                    if mtl_losses is not None:
+                        mtldataset = accum_mtl_datasets[k]
+                        mtlbatch = accum_mtl_batches[k]
+                        mtllossfn = (
+                            mtl_losses[mtldataset]
+                            if mtldataset in mtl_losses
+                            else mtl_losses['*']
                         )
-                        embeddings = [
-                            model.module.encode_text(
-                                embedding['input_ids'], normalize=True
-                            )
-                            if isinstance(model, nn.parallel.DistributedDataParallel)
-                            else model.encode_text(
-                                embedding['input_ids'], normalize=True
-                            )
-                            for embedding in emb_batch
-                        ]
+                        modelouts = [model(None, b['input_ids']) for b in mtlbatch]
+                        inputs_no_accum = {
+                            'logit_scale': modelouts[0].pop('logit_scale')
+                        }
+                        if 'logit_bias' in modelouts[0]:
+                            inputs_no_accum['logit_bias'] = modelout.pop('logit_bias')
+                        mtlfeats = []
+                        for out in modelouts:
+                            mtlfeats.append(out.pop('text_features'))
 
-                        if len(accum_emb_labels) == 0:
+                        if len(accum_mtl_labels) == 0:
                             inputs = []
-                            _cached_embeddings = list(zip(*accum_embeddings))
-                            for idx, _cached_embedding in enumerate(_cached_embeddings):
+                            _cached_features = list(zip(*accum_mtl_features))
+                            for idx, _cached_feature in enumerate(_cached_features):
                                 inputs.append(
                                     torch.cat(
-                                        _cached_embedding[:k] +
-                                        (embeddings[idx],) +
-                                        _cached_embedding[k+1:]
+                                        _cached_feature[:k]
+                                        + (mtlfeats[idx],)
+                                        + _cached_feature[k + 1 :]
                                     )
                                 )
-                            if args.emb_global_batch:
-                                assert len(emb_labels) == 0, (
-                                    'Global batch cannot be used in conjunction with '
-                                    'labeled data'
-                                )
-                                all_inputs = [
-                                    embeddings_gather(emb) for emb in inputs
-                                ]
-                                embedding_loss = emb_loss_fn(*all_inputs)
-                            else:
-                                embedding_loss = emb_loss_fn(*inputs)
+                            mtlloss = mtllossfn(
+                                *mtlfeats, **inputs_no_accum, output_dict=True
+                            )
                             del inputs
                         else:
-                            if args.emb_global_batch:
-                                raise ValueError(
-                                    'Global batch cannot be used in conjunction with '
-                                    'labeled data'
-                                )
-                            emb_labels = accum_emb_labels[k]
-                            embedding_loss = emb_loss_fn(*embeddings, *emb_labels)
+                            mtllabels = accum_mtl_labels[k]
+                            mtlloss = mtllossfn(
+                                *mtlfeats,
+                                *mtllabels,
+                                **inputs_no_accum,
+                                output_dict=True,
+                            )
 
-                        embedding_loss = args.emb_loss_weight * embedding_loss
-                        losses['embedding_loss'] += embedding_loss
-                        total_loss += embedding_loss
+                        mtlloss = args.mtl_loss_weight * mtlloss
+                        losses['mtl_loss'] += mtlloss
+                        total_loss += mtlloss
 
                 losses['loss'] += total_loss
                 backward(total_loss, model, scaler=scaler, deepspeed=args.deepspeed)
 
             losses['contrastive_loss'] = losses['contrastive_loss'] / args.accum_freq
-            losses['embedding_loss'] = losses['embedding_loss'] / args.accum_freq
+            losses['mtl_loss'] = losses['mtl_loss'] / args.accum_freq
             losses['loss'] = losses['loss'] / args.accum_freq
 
         if scaler is not None:
@@ -400,28 +419,28 @@ def train_one_epoch(
         if args.accum_freq > 1:
             accum_images, accum_texts, accum_features = [], [], {}
             (
-                accum_emb_datasets,
-                accum_emb_batches,
-                accum_emb_labels,
-                accum_embeddings
+                accum_mtl_datasets,
+                accum_mtl_batches,
+                accum_mtl_labels,
+                accum_mtl_features,
             ) = [], [], [], []
 
         # Note: we clamp to 4.6052 = ln(100), as in the original paper.
-        with torch.no_grad():
-            unwrap_model(model).logit_scale.clamp_(0, math.log(100))
+        # with torch.no_grad():
+        #     unwrap_model(model).logit_scale.clamp_(0, math.log(100))
 
-        batch_time_m.update(time.time() - start)
+        _batch_time_m.update(time.time() - start)
         start = time.time()
         batch_count = i_accum + 1
 
         if is_master(args) and (
             i_accum % args.log_every_n_steps == 0
-            or batch_count == num_batches_per_epoch
+            or batch_count == _num_batches_per_epoch
         ):
             batch_size = len(images)
             num_samples = batch_count * batch_size * args.accum_freq * args.world_size
-            samples_per_epoch = dataloader.num_samples
-            percent_complete = 100.0 * batch_count / num_batches_per_epoch
+            samples_per_epoch = train_dataloader.num_samples
+            percent_complete = 100.0 * batch_count / _num_batches_per_epoch
 
             # NOTE loss is coarsely sampled, just master node and per log update
             for key, val in losses.items():
@@ -438,16 +457,16 @@ def train_one_epoch(
                 ]
             )
             samples_per_second = (
-                args.accum_freq * args.batch_size * args.world_size / batch_time_m.val
+                args.accum_freq * args.batch_size * args.world_size / _batch_time_m.val
             )
             samples_per_second_per_gpu = (
-                args.accum_freq * args.batch_size / batch_time_m.val
+                args.accum_freq * args.batch_size / _batch_time_m.val
             )
             logging.info(
-                f'Epoch: {epoch} [{num_samples:>{sample_digits}}/'
+                f'Epoch: {epoch} [{num_samples:>{_sample_digits}}/'
                 f'{samples_per_epoch} ({percent_complete:.0f}%)] - '
-                f'Data Time: {data_time_m.avg:.3f}s - '
-                f'Batch Time: {batch_time_m.avg:.3f}s - '
+                f'Data Time: {_data_time_m.avg:.3f}s - '
+                f'Batch Time: {_batch_time_m.avg:.3f}s - '
                 f'Samples per Second: {samples_per_second:#g}/s, '
                 f'{samples_per_second_per_gpu:#g}/s/gpu - '
                 f'Last Layer LR: {optimizer.param_groups[-1]["lr"]:5f} - '
@@ -458,8 +477,8 @@ def train_one_epoch(
             # Save train loss / etc. Using non avg meter values as loggers have
             # their own smoothing
             logdata = {
-                'data_time': data_time_m.val,
-                'batch_time': batch_time_m.val,
+                'data_time': _data_time_m.val,
+                'batch_time': _batch_time_m.val,
                 'samples_per_second': samples_per_second,
                 'samples_per_second_per_gpu': samples_per_second_per_gpu,
                 'scale': logit_scale_scalar,
@@ -484,5 +503,5 @@ def train_one_epoch(
                 wandb.log(logdata, step=step)
 
             # resetting batch / data time meters per log window
-            batch_time_m.reset()
-            data_time_m.reset()
+            _batch_time_m.reset()
+            _data_time_m.reset()

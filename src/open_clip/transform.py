@@ -17,9 +17,10 @@ from torchvision.transforms import (
     Resize,
     ToTensor,
 )
+from transformers.image_utils import OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
 
-from .constants import OPENAI_DATASET_MEAN, OPENAI_DATASET_STD
-from .utils import to_2tuple
+OPENAI_DATASET_MEAN = tuple(OPENAI_CLIP_MEAN)
+OPENAI_DATASET_STD = tuple(OPENAI_CLIP_STD)
 
 
 @dataclass
@@ -41,7 +42,7 @@ class PreprocessCfg:
 
     @property
     def input_size(self):
-        return (self.num_channels,) + to_2tuple(self.size)
+        return (self.num_channels,) + (self.size, self.size)
 
 
 _PREPROCESS_KEYS = set(asdict(PreprocessCfg()).keys())
@@ -167,7 +168,8 @@ class ResizeKeepRatio:
             img (PIL Image): Image to be cropped and resized.
 
         Returns:
-            PIL Image: Resized, padded to at least target size, possibly cropped to exactly target size
+            PIL Image: Resized, padded to at least target size, possibly
+            cropped to exactly target size
         """
         size = self.get_params(
             img,
@@ -193,13 +195,14 @@ def center_crop_or_pad(
 ) -> torch.Tensor:
     """Center crops and/or pads the given image.
     If the image is torch Tensor, it is expected
-    to have [..., H, W] shape, where ... means an arbitrary number of leading dimensions.
-    If image size is smaller than output size along any edge, image is padded with 0 and then center cropped.
+    to have [..., H, W] shape, where ... means an arbitrary number of leading
+    dimensions. If image size is smaller than output size along any edge, image is
+    padded with 0 and then center cropped.
 
     Args:
         img (PIL Image or Tensor): Image to be cropped.
-        output_size (sequence or int): (height, width) of the crop box. If int or sequence with single int,
-            it is used for both directions.
+        output_size (sequence or int): (height, width) of the crop box. If int or
+        sequence with single int, it is used for both directions.
         fill (int, Tuple[int]): Padding color
 
     Returns:
@@ -233,13 +236,15 @@ def center_crop_or_pad(
 class CenterCropOrPad(torch.nn.Module):
     """Crops the given image at the center.
     If the image is torch Tensor, it is expected
-    to have [..., H, W] shape, where ... means an arbitrary number of leading dimensions.
-    If image size is smaller than output size along any edge, image is padded with 0 and then center cropped.
+    to have [..., H, W] shape, where ... means an arbitrary number of leading
+    dimensions. If image size is smaller than output size along any edge, image is
+    padded with 0 and then center cropped.
 
     Args:
         size (sequence or int): Desired output size of the crop. If size is an
             int instead of sequence like (h, w), a square crop (size, size) is
-            made. If provided a sequence of length 1, it will be interpreted as (size[0], size[0]).
+            made. If provided a sequence of length 1, it will be interpreted as
+            (size[0], size[0]).
     """
 
     def __init__(self, size, fill=0):
@@ -267,7 +272,7 @@ def _convert_to_rgb(image):
     return image.convert('RGB')
 
 
-class color_jitter(object):
+class _ColorJitter(object):
     """
     Apply Color Jitter to the PIL image with a specified probability.
     """
@@ -286,7 +291,7 @@ class color_jitter(object):
             return img
 
 
-class gray_scale(object):
+class _GrayScale(object):
     """
     Apply Gray Scale to the PIL image with a specified probability.
     """
@@ -323,7 +328,8 @@ def image_transform(
 
     interpolation = interpolation or 'bicubic'
     assert interpolation in ['bicubic', 'bilinear', 'random']
-    # NOTE random is ignored for interpolation_mode, so defaults to BICUBIC for inference if set
+    # NOTE random is ignored for interpolation_mode, so defaults to BICUBIC for
+    # inference if set
     interpolation_mode = (
         InterpolationMode.BILINEAR
         if interpolation == 'bilinear'
@@ -381,10 +387,10 @@ def image_transform(
                     aug_cfg.color_jitter is not None and len(aug_cfg.color_jitter) == 4
                 )
                 train_transform.extend(
-                    [color_jitter(*aug_cfg.color_jitter, p=aug_cfg.color_jitter_prob)]
+                    [_ColorJitter(*aug_cfg.color_jitter, p=aug_cfg.color_jitter_prob)]
                 )
             if aug_cfg.gray_scale_prob:
-                train_transform.extend([gray_scale(aug_cfg.gray_scale_prob)])
+                train_transform.extend([_GrayScale(aug_cfg.gray_scale_prob)])
             train_transform.extend(
                 [
                     ToTensor(),
@@ -394,7 +400,8 @@ def image_transform(
             train_transform = Compose(train_transform)
             if aug_cfg_dict:
                 warnings.warn(
-                    f'Unused augmentation cfg items, specify `use_timm` to use ({list(aug_cfg_dict.keys())}).'
+                    f'Unused augmentation cfg items, specify `use_timm` to use '
+                    f'({list(aug_cfg_dict.keys())}).'
                 )
         return train_transform
     else:
@@ -416,7 +423,8 @@ def image_transform(
             if not isinstance(image_size, (tuple, list)):
                 image_size = (image_size, image_size)
             if image_size[0] == image_size[1]:
-                # simple case, use torchvision built-in Resize w/ shortest edge mode (scalar size arg)
+                # simple case, use torchvision built-in Resize w/ shortest edge mode
+                # (scalar size arg)
                 transforms = [Resize(image_size[0], interpolation=interpolation_mode)]
             else:
                 # resize shortest edge to matching target dim for non-square target

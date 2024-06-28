@@ -1,19 +1,11 @@
-import glob
-import json
 import logging
 import os
-import random
-import re
 import shutil
-import subprocess
 import sys
 from datetime import datetime
-from functools import partial
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
 
 try:
     import wandb
@@ -25,155 +17,25 @@ try:
 except ImportError:
     tensorboard = None
 
-from open_clip import (
-    create_loss,
-    create_model_and_transforms,
-    get_tokenizer,
-    trace_model,
-)
-from open_clip.tokenizer import DEFAULT_CONTEXT_LENGTH
-
-from training.data import MultiS3EmbeddingDataset, dynamic_collate, get_multimodal_data
+from open_clip import create_model_and_transforms, get_tokenizer
 from training.distributed import broadcast_object, init_distributed_device, is_master
 from training.eval import evaluate
-from training.fileutils import pt_load, remote_sync, start_sync_process
-from training.logger import setup_logging
+from training.factory import create_dataloaders, create_losses
 from training.optimizer import create_optimizer
 from training.params import parse_args
 from training.scheduler import create_scheduler
 from training.train import train_one_epoch
+from training.utils import (
+    copy_codebase,
+    get_latest_checkpoint,
+    pytorch_load,
+    random_seed,
+    remote_sync,
+    setup_logging,
+    start_sync_process,
+)
 
-LATEST_CHECKPOINT_NAME = 'epoch_latest.pt'
-
-
-def random_seed(seed=42, rank=0):
-    torch.manual_seed(seed + rank)
-    np.random.seed(seed + rank)
-    random.seed(seed + rank)
-
-
-def natural_key(string_):
-    """See https://www.codinghorror.com/blog/archives/001018.html"""
-    return [int(s) if s.isdigit() else s for s in re.split(r'(\d+)', string_.lower())]
-
-
-def get_latest_checkpoint(path: str, remote: bool):
-    # as writen, this glob recurses, so can pick up checkpoints across
-    # multiple sub-folders
-    if remote:
-        result = subprocess.run(
-            ['aws', 's3', 'ls', path + '/'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        print(result)
-        if result.returncode == 1:
-            return None
-        checkpoints = [
-            os.path.join(path, x.split(' ')[-1])
-            for x in result.stdout.decode().split('\n')[:-1]
-        ]
-    else:
-        checkpoints = glob.glob(path + '**/*.pt', recursive=True)
-    if checkpoints:
-        checkpoints = sorted(checkpoints, key=natural_key)
-        return checkpoints[-1]
-    return None
-
-
-def create_embeddings_dataloader(args):
-
-    import training.embloss as embeddings_loss_module
-
-    embeddings_dataset = None
-
-    try:
-        loss_init = json.loads(args.emb_losses)
-    except json.JSONDecodeError:
-        loss_init = [{'name': loss} for loss in args.emb_losses.split(',')]
-
-    loss_init = loss_init or [{'name': 'InfoNCELoss'}]
-
-    for d in loss_init:
-        d['name'] = getattr(embeddings_loss_module, d['name'])
-        if 'tasks' not in d:
-            d['tasks'] = '*'
-        if 'options' not in d:
-            d['options'] = {}
-
-    task_dict = {
-        task: d['name'](**d['options']) for d in loss_init for task in d['tasks']
-    }
-    input_type_dict = {k: v.input_type for (k, v) in task_dict.items()}
-
-    for loss_fn in task_dict.values():
-        logging.info(f'Setting up loss: {loss_fn.__class__.__name__}')
-
-    logging.info('Building embedding dataset ...')
-    if args.resume:
-        embeddings_dataset_checkpoint = os.path.join(
-            args.resume, f'worker{args.rank}-dataset.json'
-        )
-        if os.path.isfile(embeddings_dataset_checkpoint):
-            logging.info(
-                f'Loading from checkpoint {embeddings_dataset_checkpoint} ...'
-            )
-            embeddings_dataset = MultiS3EmbeddingDataset.load_from_json(
-                embeddings_dataset_checkpoint,
-                world_size=args.world_size,
-                global_rank=args.rank,
-            )
-    if embeddings_dataset is None:
-        logging.info(
-            f'Bucket: {args.emb_datasets_s3_bucket}, Datasets: {args.emb_datasets}'
-        )
-        datasets = args.emb_datasets.split(',')
-        sampling_rates = [float(v) for v in args.emb_sampling_rates.split(',')]
-        sampling_rates = {
-            dataset: sr for dataset, sr in zip(datasets, sampling_rates)
-        }
-        embeddings_dataset = MultiS3EmbeddingDataset(
-            bucket=args.emb_datasets_s3_bucket,
-            batch_size=args.emb_batch_size,
-            input_type_dict=input_type_dict,
-            datasets=datasets,
-            max_shards=args.emb_max_shards,
-            world_size=args.world_size,
-            global_rank=args.rank,
-            sampling_rates=sampling_rates,
-            num_batches=args.emb_num_batches,
-            max_batches=args.emb_max_batches,
-            seed=args.seed,
-            synchronous=args.emb_global_batch,
-        )
-
-    logging.info('Setting up the embedding dataloader')
-
-    embeddings_tokenizer = AutoTokenizer.from_pretrained(
-        args.emb_tokenizer_name, force_download=True
-    )
-    embeddings_dataloader = DataLoader(
-        dataset=embeddings_dataset,
-        collate_fn=partial(
-            dynamic_collate,
-            tokenizer=embeddings_tokenizer,
-            tokenizer_options={
-                'padding': 'max_length',
-                'truncation': True,
-                'max_length': (
-                    args.emb_max_sequence_length
-                    or args.max_sequence_length
-                    or DEFAULT_CONTEXT_LENGTH
-                ),
-                'return_tensors': 'pt',
-            },
-            input_type_dict=input_type_dict,
-        ),
-        batch_size=args.emb_batch_size,
-        pin_memory=True,
-    )
-
-    return embeddings_dataset, embeddings_dataloader, task_dict
+LATEST_CHECKPOINT_NAME = 'epoch-latest.pt'
 
 
 def main(args):
@@ -194,7 +56,7 @@ def main(args):
     if args.name is None:
         # sanitize model name for filesystem / uri use,
         # easier if we don't use / in name as a rule?
-        model_name_safe = args.model.replace('/', '-')
+        _model_name_safe = args.model.replace('/', '-')
         datestr = datetime.now().strftime('%Y_%m_%d-%H_%M_%S')
         if args.distributed:
             # sync date_str from master to all ranks
@@ -202,7 +64,7 @@ def main(args):
         args.name = '-'.join(
             [
                 datestr,
-                f'model_{model_name_safe}',
+                f'model_{_model_name_safe}',
                 f'lr_{args.lr}',
                 f'b_{args.batch_size}',
                 f'j_{args.workers}',
@@ -210,31 +72,33 @@ def main(args):
             ]
         )
 
-    resume_latest = args.resume == 'latest'
-    log_base_path = os.path.join(args.logs, args.name)
+    _resume_latest = args.resume == 'latest'
+    _log_base_path = os.path.join(args.logs, args.name)
+
     args.log_path = None
     if is_master(args, local=args.log_local):
-        os.makedirs(log_base_path, exist_ok=True)
-        log_filename = f'out-{args.rank}' if args.log_local else 'out.log'
-        args.log_path = os.path.join(log_base_path, log_filename)
-        if os.path.exists(args.log_path) and not resume_latest:
-            print(
-                'Error. Experiment already exists. Use --name {} to '
+        os.makedirs(_log_base_path, exist_ok=True)
+        _log_filename = f'out-{args.rank}.log' if args.log_local else 'out.log'
+        args.log_path = os.path.join(_log_base_path, _log_filename)
+        if os.path.exists(args.log_path) and not _resume_latest:
+            logging.error(
+                f'Experiment {args.name} already exists. Use --name to '
                 'specify a new experiment.'
             )
             return -1
 
-    # Setup text logger
+    # setup logger
     args.log_level = logging.DEBUG if args.debug else logging.INFO
-    setup_logging(args.log_path, args.log_level)
+    setup_logging(args.log_path, args.log_level, include_host=True)
 
-    # Setup wandb, tensorboard, checkpoint logging
+    # setup wandb, tensorboard, checkpoint logging
     args.wandb = 'wandb' in args.report_to or 'all' in args.report_to
     args.tensorboard = 'tensorboard' in args.report_to or 'all' in args.report_to
-    args.checkpoint_path = os.path.join(log_base_path, 'checkpoints')
+    args.checkpoint_path = os.path.join(_log_base_path, 'checkpoints')
+
     if is_master(args):
         args.tensorboard_path = (
-            os.path.join(log_base_path, 'tensorboard') if args.tensorboard else ''
+            os.path.join(_log_base_path, 'tensorboard') if args.tensorboard else ''
         )
         for dirname in [args.tensorboard_path, args.checkpoint_path]:
             if dirname:
@@ -242,21 +106,23 @@ def main(args):
     else:
         args.tensorboard_path = ''
 
-    if resume_latest:
-        resume_from = None
-        checkpoint_path = args.checkpoint_path
+    if _resume_latest:
+        _resume_from = None
+        _checkpoint_path = args.checkpoint_path
         # If using remote_sync, need to check the remote instead of
         # the local checkpoints folder.
         if args.remote_sync is not None:
-            checkpoint_path = os.path.join(args.remote_sync, args.name, 'checkpoints')
+            _checkpoint_path = os.path.join(args.remote_sync, args.name, 'checkpoints')
             if args.save_most_recent:
-                print(
+                logging.error(
                     'Error. Cannot use save-most-recent with remote_sync and '
                     'resume latest.'
                 )
                 return -1
             if args.remote_sync_protocol != 's3':
-                print('Error. Sync protocol not supported when using resume latest.')
+                logging.error(
+                    'Error. Sync protocol not supported when using resume latest.'
+                )
                 return -1
 
         if is_master(args):
@@ -266,30 +132,34 @@ def main(args):
             # situations.
             if args.save_most_recent:
                 # if --save-most-recent flag is set, look for latest at a fixed filename
-                resume_from = os.path.join(checkpoint_path, LATEST_CHECKPOINT_NAME)
-                if not os.path.exists(resume_from):
+                _resume_from = os.path.join(_checkpoint_path, LATEST_CHECKPOINT_NAME)
+                if not os.path.exists(_resume_from):
                     # If no latest checkpoint has been saved yet, don't try to resume
-                    resume_from = None
+                    _resume_from = None
             else:
                 # otherwise, list checkpoint dir contents and pick the newest checkpoint
-                resume_from = get_latest_checkpoint(
-                    checkpoint_path, remote=args.remote_sync is not None
+                _resume_from = get_latest_checkpoint(
+                    _checkpoint_path, remote=args.remote_sync is not None
                 )
-            if resume_from:
-                logging.info(f'Found latest resume checkpoint at {resume_from}.')
+            if _resume_from:
+                logging.info(f'Found latest checkpoint: {_resume_from}.')
             else:
-                logging.info(f'No latest resume checkpoint found in {checkpoint_path}.')
+                logging.info(f'No latest checkpoint found in {_checkpoint_path}.')
+
         if args.distributed:
             # sync found checkpoint path to all ranks
-            resume_from = broadcast_object(args, resume_from)
-        args.resume = resume_from
+            _resume_from = broadcast_object(args, _resume_from)
+
+        args.resume = _resume_from
 
     if args.copy_codebase:
-        copy_codebase(args)
+        copy_codebase(args.logs, args.name)
 
     # start the sync proces if remote-sync is not None
-    remote_sync_process = None
+    _remote_sync_process = None
     if is_master(args) and args.remote_sync is not None:
+        logging.info('Checking remote sync ...')
+
         # first make sure it works
         result = remote_sync(
             os.path.join(args.logs, args.name),
@@ -297,24 +167,26 @@ def main(args):
             args.remote_sync_protocol,
         )
         if result:
-            logging.info('remote sync successful.')
+            logging.info('Remote sync successful')
         else:
-            logging.info('Error: remote sync failed. Exiting.')
+            logging.error('Error: remote sync failed, exiting ...')
             return -1
+
         # if all looks good, start a process to do this every
         # args.remote_sync_frequency seconds
-        remote_sync_process = start_sync_process(
+        _remote_sync_process = start_sync_process(
             args.remote_sync_frequency,
             os.path.join(args.logs, args.name),
             os.path.join(args.remote_sync, args.name),
             args.remote_sync_protocol,
         )
-        remote_sync_process.start()
+        _remote_sync_process.start()
 
     if args.precision == 'fp16':
         logging.warning(
             'It is recommended to use AMP mixed-precision instead of FP16. '
-            'FP16 support needs further verification and tuning, especially for train.'
+            'FP16 support needs further verification and tuning, especially for '
+            'training.'
         )
 
     if args.horovod:
@@ -330,17 +202,19 @@ def main(args):
             f'{args.local_rank}), total {args.world_size}.'
         )
     else:
-        logging.info(f'Running with a single process. Device {args.device}.')
+        logging.info(f'Running with a single process, device {args.device}.')
 
-    dist_model = None
+    distill_model = None
     args.distill = (
         args.distill_model is not None and args.distill_pretrained is not None
     )
     if args.distill:
-        # FIXME: support distillation with grad accum.
-        assert args.accum_freq == 1
-        # FIXME: support distillation with coca.
-        assert 'coca' not in args.model.lower()
+        assert (
+            args.accum_freq == 1
+        ), 'Model distillation does not work with gradient accumulation'
+        assert (
+            'coca' not in args.model.lower()
+        ), 'Model distillation does not work with CoCa models'
 
     if (
         isinstance(args.force_image_size, (tuple, list))
@@ -350,10 +224,28 @@ def main(args):
         args.force_image_size = args.force_image_size[0]
 
     random_seed(args.seed, 0)
-    model_kwargs = {}
+
+    _model_kwargs = {'freeze_logit_scale': False}
     if args.siglip:
-        model_kwargs['init_logit_scale'] = np.log(10)  # different from CLIP
-        model_kwargs['init_logit_bias'] = -10
+        _model_kwargs.update(
+            {
+                'init_logit_scale': np.log(1 / 0.1),
+                'init_logit_bias': -10,
+            }
+        )
+    else:
+        _model_kwargs.update(
+            {
+                'init_logit_scale': np.log(1 / 0.07),
+                'init_logit_bias': None,
+            }
+        )
+
+    if args.temperature:
+        _model_kwargs['init_logit_scale'] = np.log(1 / args.temperature)
+
+    if args.freeze_temperature:
+        _model_kwargs['freeze_logit_scale'] = True
 
     model, preprocess_train, preprocess_val = create_model_and_transforms(
         args.model,
@@ -368,17 +260,17 @@ def main(args):
         image_mean=args.image_mean,
         image_std=args.image_std,
         image_interpolation=args.image_interpolation,
-        image_resize_mode=args.image_resize_mode,  # only effective for inference
+        image_resize_mode=args.image_resize_mode,
         aug_cfg=args.aug_cfg,
         pretrained_image=args.pretrained_image,
         output_dict=True,
-        pretrained_hf=args.hf_load_pretrained,
-        **model_kwargs,
+        pretrained_hf=not args.hf_random_init,
+        **_model_kwargs,
     )
     if args.distill:
         # FIXME: currently assumes the model you're distilling from
         #  has the same tokenizer & transforms.
-        dist_model, _, _ = create_model_and_transforms(
+        distill_model, _, _ = create_model_and_transforms(
             args.distill_model,
             args.distill_pretrained,
             device=device,
@@ -386,7 +278,7 @@ def main(args):
             output_dict=True,
         )
     if args.use_bnb_linear is not None:
-        print(
+        logging.warning(
             '=> using a layer from bitsandbytes.\n'
             '   this is an experimental feature which requires two extra pip installs\n'
             '   pip install bitsandbytes triton'
@@ -395,17 +287,14 @@ def main(args):
         import bitsandbytes as bnb
         from open_clip.utils import replace_linear
 
-        print(f'=> replacing linear layers with {args.use_bnb_linear}')
-        linear_replacement_cls = getattr(
+        logging.debug(f'=> replacing linear layers with {args.use_bnb_linear}')
+        _linear_replacement_cls = getattr(
             bnb.nn.triton_based_modules, args.use_bnb_linear
         )
-        replace_linear(model, linear_replacement_cls)
+        replace_linear(model, _linear_replacement_cls)
         model = model.to(device)
 
     random_seed(args.seed, args.rank)
-
-    if args.trace:
-        model = trace_model(model, batch_size=args.batch_size, device=device)
 
     if args.lock_image:
         # lock image tower as per LiT - https://arxiv.org/abs/2111.07991
@@ -415,47 +304,45 @@ def main(args):
         )
     if args.lock_text:
         model.lock_text_tower(
-            unlocked_layers=args.lock_text_unlocked_layers,
+            unlocked_layers=args.lock_text_unlocked_groups,
             freeze_layer_norm=args.lock_text_freeze_layer_norm,
         )
 
     if args.grad_checkpointing:
         model.set_grad_checkpointing()
 
-    params_file = ''
+    _params_file = ''
     if is_master(args):
-        logging.info('Model:')
-        logging.info(f'{str(model)}')
-        logging.info('Params:')
-        params_file = os.path.join(args.logs, args.name, 'params.txt')
-        with open(params_file, 'w') as f:
+        logging.info(f'Model: {str(model)}')
+        logging.debug('Parameters:')
+        _params_file = os.path.join(args.logs, args.name, 'params.txt')
+        with open(_params_file, 'w') as f:
             for name in sorted(vars(args)):
                 val = getattr(args, name)
-                logging.info(f'  {name}: {val}')
+                logging.debug(f'  {name}: {val}')
                 f.write(f'{name}: {val}\n')
 
-    if args.distributed and not args.horovod and not args.deepspeed:
+    if args.distributed and not (args.horovod or args.deepspeed):
         if args.use_bn_sync:
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-        ddp_args = {}
+
+        _ddp_args = {}
         if args.ddp_static_graph:
             # this doesn't exist in older PyTorch, arg only added if enabled
-            ddp_args['static_graph'] = True
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[device], **ddp_args
-        )
+            _ddp_args['static_graph'] = True
 
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[device], **_ddp_args
+        )
         if args.distill:
-            dist_model = torch.nn.parallel.DistributedDataParallel(
-                dist_model, device_ids=[device], **ddp_args
+            distill_model = torch.nn.parallel.DistributedDataParallel(
+                distill_model, device_ids=[device], **_ddp_args
             )
 
     # create optimizer and scaler
     optimizer = None
     scaler = None
-
     if args.train_data or args.dataset_type == 'synthetic':
-        assert not args.trace, 'Cannot train with traced model'
         model, optimizer, scaler = create_optimizer(
             args=args, model=model, dsinit=dsinit
         )
@@ -466,93 +353,91 @@ def main(args):
         if args.deepspeed:
             if os.path.exists(args.resume):
                 import glob
-                all_checkpoints = glob.glob(os.path.join(args.resume, 'epoch_*'))
-                latest_ckpt = -1
-                for ckpt in all_checkpoints:
+
+                _all_checkpoints = glob.glob(os.path.join(args.resume, 'epoch-*'))
+                _latest_ckpt = -1
+                for ckpt in _all_checkpoints:
                     t = ckpt.split('/')[-1].split('_')[1]
                     if t.isdigit():
-                        latest_ckpt = max(int(t), latest_ckpt)
-                if latest_ckpt >= 0:
-                    start_epoch = latest_ckpt
+                        _latest_ckpt = max(int(t), _latest_ckpt)
+
+                if _latest_ckpt >= 0:
+                    start_epoch = _latest_ckpt
                     _, client_states = model.load_checkpoint(
-                        args.resume, tag=f'epoch_{latest_ckpt}'
+                        args.resume, tag=f'epoch-{_latest_ckpt}'
                     )
                     logging.info(
-                        f'=> resuming checkpoint \'{args.resume}\' '
-                        f'(epoch {latest_ckpt})'
+                        f"=> resuming from checkpoint '{args.resume}' "
+                        f'(epoch {_latest_ckpt})'
                     )
                 else:
-                    logging.info(f'=> no checkpoint found at \'{args.resume}\'')
+                    logging.info(f"=> no checkpoint found at '{args.resume}'")
             else:
-                logging.info(f'=> \'{args.resume}\' does not exist!')
+                logging.info(f"=> '{args.resume}' does not exist!")
         else:
-            checkpoint = pt_load(
+            checkpoint = pytorch_load(
                 os.path.join(args.resume, 'state.pt'), map_location='cpu'
             )
             if 'epoch' in checkpoint:
                 # resuming a train checkpoint w/ epoch and optimizer state
                 start_epoch = checkpoint['epoch']
                 sd = checkpoint['state_dict']
-                if (
-                    not args.distributed
-                    and next(iter(sd.items()))[0].startswith('module')
+                if not args.distributed and next(iter(sd.items()))[0].startswith(
+                    'module'
                 ):
-                    sd = {k[len('module.'):]: v for k, v in sd.items()}
+                    sd = {k[len('module.') :]: v for k, v in sd.items()}
                 model.load_state_dict(sd)
                 if optimizer is not None:
                     checkpoint['optimizer']['param_groups'] = optimizer.state_dict()[
                         'param_groups'
-                        ]
+                    ]
                     optimizer.load_state_dict(checkpoint['optimizer'])
                 if scaler is not None and 'scaler' in checkpoint:
                     scaler.load_state_dict(checkpoint['scaler'])
                 logging.info(
-                    f'=> resuming checkpoint \'{args.resume}\' (epoch {start_epoch})'
+                    f"=> resuming from checkpoint '{args.resume}' "
+                    f'(epoch {start_epoch})'
                 )
             else:
                 # loading a bare (model only) checkpoint for fine-tune or evaluation
                 model.load_state_dict(checkpoint)
                 logging.info(
-                    f'=> loaded checkpoint \'{args.resume}\' (epoch {start_epoch})'
+                    f"=> loaded checkpoint '{args.resume}' (epoch {start_epoch})"
                 )
 
-    # initialize datasets
-    # multimodal
+    loss, mtl_losses = create_losses(args)
+
     tokenizer = get_tokenizer(args.model, context_length=args.max_sequence_length)
-    data = get_multimodal_data(
+    data = create_dataloaders(
         args,
-        (preprocess_train, preprocess_val),
+        preprocess_train,
+        preprocess_val,
         epoch=start_epoch,
         tokenizer=tokenizer,
+        mtl_losses=mtl_losses,
     )
-    assert len(data), (
-        'At least one train or eval dataset must be specified.'
-    )
+    assert len(data), 'At least one train or eval dataset must be specified.'
 
-    emb_dataset, emb_dataloader, emb_losses = None, None, None
-    if args.mtl:
-        emb_dataset, emb_dataloader, emb_losses = create_embeddings_dataloader(args)
-
-    # create scheduler if train
+    # create scheduler if training
     scheduler = None
     if 'train' in data and optimizer is not None:
-        total_steps = (
+        _total_steps = (
             data['train'].dataloader.num_batches // args.accum_freq
         ) * args.epochs
-        cooldown_steps = None
+        _cooldown_steps = None
         if args.epochs_cooldown is not None:
-            cooldown_steps = (
+            _cooldown_steps = (
                 data['train'].dataloader.num_batches // args.accum_freq
             ) * args.epochs_cooldown
-
         scheduler = create_scheduler(
             optimizer=optimizer,
             baselr=args.lr,
             warmup_steps=args.warmup,
-            total_steps=total_steps,
-            cooldown_steps=cooldown_steps,
+            total_steps=_total_steps,
+            cooldown_steps=_cooldown_steps,
             cooldown_power=args.lr_cooldown_power,
             cooldown_end_lr=args.lr_cooldown_end,
+            scheduler_type=args.lr_scheduler,
         )
 
     # determine if this worker should save logs and checkpoints. only do so if it
@@ -565,6 +450,7 @@ def main(args):
 
     if args.wandb and is_master(args):
         assert wandb is not None, 'Please install wandb.'
+
         logging.debug('Starting WandB ...')
         args.train_sz = data['train'].dataloader.num_samples
         if args.val_data is not None:
@@ -582,15 +468,16 @@ def main(args):
         )
         if args.debug:
             wandb.watch(model, log='all')
-        wandb.save(params_file)
-        logging.debug('Finished loading WandB')
+
+        wandb.save(_params_file)
+        logging.debug('Finished setting up WandB')
 
     # Pytorch 2.0 adds '_orig_mod.' prefix to keys of state_dict() of compiled models.
     # For compatibility, we save state_dict() of the original model, which shares the
     # weights without the prefix.
     original_model = model
     if args.torchcompile:
-        logging.info('Compiling model...')
+        logging.info('Compiling model ...')
         model = torch.compile(original_model)
 
     if 'train' not in data:
@@ -599,8 +486,6 @@ def main(args):
             from open_clip.utils import convert_int8_model_to_inference_mode
 
             convert_int8_model_to_inference_mode(model)
-
-        # Evaluate.
         evaluate(
             model,
             preprocess_val,
@@ -623,139 +508,121 @@ def main(args):
             tb_writer=writer,
         )
 
-    loss = create_loss(args)
-
     for epoch in range(start_epoch, args.epochs):
         if is_master(args):
-            logging.info(f'Start epoch {epoch}')
+            logging.info(f'Starting epoch {epoch}')
 
         train_one_epoch(
             model,
             data,
             loss,
+            mtl_losses,
             epoch,
             optimizer,
             scaler,
             scheduler,
-            dist_model,
+            distill_model,
             args,
-            emb_dataloader=emb_dataloader,
-            emb_losses=emb_losses,
             tb_writer=writer,
         )
-        completed_epoch = epoch + 1
+        _completed_epoch = epoch + 1
 
-        # Saving checkpoints.
-        # is_master(args) can not be here while using deepspped, otherwise ckpts
+        # saving checkpoints
+        # is_master(args) can not be here while using deepspeed, otherwise ckpts
         # can not be saved
         if args.logs and args.logs.lower() != 'none' and args.deepspeed:
-            ds_checkpoint_path = os.path.join(args.logs, args.name, 'checkpoints')
-            if completed_epoch == args.epochs or (
-                args.save_frequency > 0 and (completed_epoch % args.save_frequency) == 0
+            _ds_checkpoint_path = os.path.join(args.logs, args.name, 'checkpoints')
+            if _completed_epoch == args.epochs or (
+                args.save_frequency > 0
+                and (_completed_epoch % args.save_frequency) == 0
             ):
-                client_state = {'epoch': completed_epoch}
+                client_state = {'epoch': _completed_epoch}
                 model.save_checkpoint(
-                    save_dir=ds_checkpoint_path,
-                    tag=f'epoch_{str(completed_epoch)}',
-                    client_state=client_state
+                    save_dir=_ds_checkpoint_path,
+                    tag=f'epoch-{str(_completed_epoch)}',
+                    client_state=client_state,
                 )
         elif args.save_logs:
-            checkpoint_dict = {
-                'epoch': completed_epoch,
+            _checkpoint_dict = {
+                'epoch': _completed_epoch,
                 'name': args.name,
                 'state_dict': original_model.state_dict(),
                 'optimizer': optimizer.state_dict(),
             }
             if scaler is not None:
-                checkpoint_dict['scaler'] = scaler.state_dict()
+                _checkpoint_dict['scaler'] = scaler.state_dict()
 
-            if completed_epoch == args.epochs or (
-                args.save_frequency > 0 and (completed_epoch % args.save_frequency) == 0
+            if _completed_epoch == args.epochs or (
+                args.save_frequency > 0
+                and (_completed_epoch % args.save_frequency) == 0
             ):
-                ckpt_dir = f'epoch-{completed_epoch}'
+                _ckpt_dir = f'epoch-{_completed_epoch}'
                 os.makedirs(
-                    os.path.join(args.checkpoint_path, ckpt_dir), exist_ok=False
+                    os.path.join(args.checkpoint_path, _ckpt_dir), exist_ok=False
                 )
-                model_ckpt_path = os.path.join(
-                    args.checkpoint_path, ckpt_dir, 'state.pt'
+                _model_ckpt_path = os.path.join(
+                    args.checkpoint_path, _ckpt_dir, 'state.pt'
                 )
-                torch.save(checkpoint_dict, model_ckpt_path)
-                if emb_dataset is not None:
+                torch.save(_checkpoint_dict, _model_ckpt_path)
+                if data['train-s3'] is not None:
                     dataset_ckpt_path = os.path.join(
                         args.checkpoint_path,
-                        ckpt_dir,
-                        f'worker{args.rank}-dataset.json'
+                        _ckpt_dir,
+                        f'worker{args.rank}-s3-dataset.json',
                     )
-                    emb_dataset.write_to_json(dataset_ckpt_path)
+                    data['train-s3'][0].write_to_json(dataset_ckpt_path)
+                if data['train-mtl'] is not None:
+                    dataset_ckpt_path = os.path.join(
+                        args.checkpoint_path,
+                        _ckpt_dir,
+                        f'worker{args.rank}-mtl-dataset.json',
+                    )
+                    data['train-mtl'][0].write_to_json(dataset_ckpt_path)
 
             if args.delete_previous_checkpoint:
-                previous_checkpoint = os.path.join(
-                    args.checkpoint_path, f'epoch-{completed_epoch - 1}'
+                _previous_checkpoint = os.path.join(
+                    args.checkpoint_path, f'epoch-{_completed_epoch - 1}'
                 )
-                if os.path.exists(previous_checkpoint):
-                    shutil.rmtree(previous_checkpoint)
+                if os.path.exists(_previous_checkpoint):
+                    shutil.rmtree(_previous_checkpoint)
 
             if args.save_most_recent:
                 # try not to corrupt the latest checkpoint if save fails
-                tmp_save_path = os.path.join(args.checkpoint_path, 'tmp.pt')
-                latest_save_path = os.path.join(
+                _tmp_save_path = os.path.join(args.checkpoint_path, 'tmp.pt')
+                _latest_save_path = os.path.join(
                     args.checkpoint_path, LATEST_CHECKPOINT_NAME
                 )
-                torch.save(checkpoint_dict, tmp_save_path)
-                os.replace(tmp_save_path, latest_save_path)
+                torch.save(_checkpoint_dict, _tmp_save_path)
+                os.replace(_tmp_save_path, _latest_save_path)
 
-        if (
-            any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2'))
-            or args.clip_benchmark_frequency != 0
-            or args.mteb_frequency != 0
-        ):
-            evaluate(
-                model,
-                preprocess_val,
-                tokenizer,
-                data,
-                completed_epoch,
-                args,
-                tb_writer=writer,
-            )
+        evaluate(
+            model,
+            preprocess_val,
+            tokenizer,
+            data,
+            _completed_epoch,
+            args,
+            tb_writer=writer,
+        )
 
+    # stop wandb
     if args.wandb and is_master(args):
         wandb.finish()
 
-    # run a final sync.
-    if remote_sync_process is not None:
-        logging.info('Final remote sync.')
-        remote_sync_process.terminate()
+    # run a final sync
+    if _remote_sync_process is not None:
+        _remote_sync_process.terminate()
+
+        logging.info('Final remote sync ...')
         result = remote_sync(
             os.path.join(args.logs, args.name),
             os.path.join(args.remote_sync, args.name),
             args.remote_sync_protocol,
         )
         if result:
-            logging.info('Final remote sync successful.')
+            logging.info('Final remote sync successful')
         else:
-            logging.info('Final remote sync failed.')
-
-
-def copy_codebase(args):
-    from shutil import copytree, ignore_patterns
-
-    new_code_path = os.path.join(args.logs, args.name, 'code')
-    if os.path.exists(new_code_path):
-        print(
-            f'Error. Experiment already exists at {new_code_path}. '
-            f'Use --name to specify a new experiment.'
-        )
-        return -1
-    print(f'Copying codebase to {new_code_path}')
-    current_code_path = os.path.realpath(__file__)
-    for _ in range(3):
-        current_code_path = os.path.dirname(current_code_path)
-    copytree(
-        current_code_path, new_code_path, ignore=ignore_patterns('log', 'logs', 'wandb')
-    )
-    print('Done copying code.')
-    return 1
+            logging.info('Final remote sync failed')
 
 
 if __name__ == '__main__':

@@ -6,13 +6,14 @@ import random
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from enum import IntEnum
 from itertools import islice
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from torch.utils.data import IterableDataset
-
-from training.data.embeddings.utils import (
+from training.data.utils import (
     SimLMCrossEncoder,
+    add_instruction,
     download_shard,
     get_dataset_info,
     get_directories,
@@ -20,27 +21,51 @@ from training.data.embeddings.utils import (
     get_shards,
     log_on_rank,
 )
-from training.embloss import InputType, get_tuple_length
 
 csv.field_size_limit(sys.maxsize)
 
 
-class S3EmbeddingDataset(IterableDataset):
+class InputType(IntEnum):
+    PAIR = 2
+    TRIPLET = 3
+    SCORED_TRIPLET = 4
+    MULTIPLE_NEGATIVES = 5
+    MULTIPLE_NEGATIVES_WITHOUT_SCORES = 6
+    PAIR_WITH_SCORES = 7
+    TEXT_WITH_LABEL = 8
+
+
+def get_tuple_length(input_type: InputType):
+    if input_type in (InputType.PAIR, InputType.PAIR_WITH_SCORES):
+        return 2
+    elif input_type in (InputType.TRIPLET, InputType.SCORED_TRIPLET):
+        return 3
+    elif input_type in (InputType.TEXT_WITH_LABEL,):
+        return 1
+    elif input_type in (
+        InputType.MULTIPLE_NEGATIVES,
+        InputType.MULTIPLE_NEGATIVES_WITHOUT_SCORES,
+    ):
+        return 9
+
+
+class S3Dataset(IterableDataset):
     def __init__(
         self,
         bucket: str,
         dataset: str,
+        world_size: int,
+        global_rank: int,
         input_type_dict: Dict[str, str],
         task_type: Optional[str] = None,
         directory: Optional[str] = None,
         max_shards: Optional[int] = None,
         dialect: Literal['csv', 'tsv'] = 'tsv',
         shard_num: int = 0,
-        world_size: int = 0,
-        global_rank: int = 0,
         index: Optional[int] = None,
         ce_model_name='intfloat/simlm-msmarco-reranker',
         interleaved=False,
+        task_implementation: Literal['none', 'instruction-based'] = 'none',
     ):
         """A dataset that iterates through shards of a dataset stored
             in an S3 bucket.
@@ -68,6 +93,7 @@ class S3EmbeddingDataset(IterableDataset):
             index if index is not None else (global_rank if interleaved else 0)
         )
         self._task_type = task_type
+        self._task_implementation = task_implementation
 
         self._dataset = dataset
         shards = get_shards(
@@ -121,9 +147,8 @@ class S3EmbeddingDataset(IterableDataset):
         if len(self._shards) > 0:
             shard_len = get_shard_size(self._bucket, self._shards[0], self._dialect)
 
-            if (
-                1 < len(shards) <= stop_index
-                and (max_shards is None or max_shards >= len(shards))
+            if 1 < len(shards) <= stop_index and (
+                max_shards is None or max_shards >= len(shards)
             ):
                 end_shard_len = get_shard_size(
                     self._bucket, self._shards[-1], self._dialect
@@ -182,7 +207,7 @@ class S3EmbeddingDataset(IterableDataset):
         future_shard_pth = self._async_download_shard(self._current_shard_num)
 
         for shard_num, shard in enumerate(
-            self._shards[self._current_shard_num:], self._current_shard_num
+            self._shards[self._current_shard_num :], self._current_shard_num
         ):
             self._current_shard = shard
             self._current_shard_num = shard_num
@@ -230,8 +255,16 @@ class S3EmbeddingDataset(IterableDataset):
                 if self._input_has_score:
                     scores = [float(row[-1])]
 
-                yield self._dataset, (out, scores)
+                if self._task_implementation == 'instruction-based':
+                    out = add_instruction(out, task_type=self._task_type)
 
+                yield (
+                    self._dataset,
+                    (
+                        out,
+                        scores,
+                    ),
+                )
             file.close()
 
             if not os.path.exists(self._bucket):  # local bucket
@@ -261,18 +294,19 @@ def _path_to_name(pth: str) -> str:
     return pth.split('/')[-1]
 
 
-class MultiS3EmbeddingDataset(IterableDataset):
+class MultiDataset(IterableDataset):
     def __init__(
         self,
         bucket: str,
+        world_size: int,
+        global_rank: int,
         batch_size: int,
         input_type_dict: Dict[str, str],
-        datasets: Optional[Union[List[str], Dict[str, Any]]] = None,
+        datasets: Optional[Union[List[str], List[Dict[str, Any]]]] = None,
         max_shards: Optional[int] = None,
-        world_size: int = 0,
-        global_rank: int = 0,
         sampling_rates: Optional[Dict[str, float]] = None,
         task_types: Optional[Dict[str, str]] = None,
+        task_implementation: Literal['none', 'instruction-based'] = 'none',
         max_batches: Optional[int] = None,
         num_batches: int = 0,
         dialect: Literal['csv', 'tsv'] = 'tsv',
@@ -299,6 +333,8 @@ class MultiS3EmbeddingDataset(IterableDataset):
             dataset.
             Datasets with a higher sampling rate will be sampled from more often.
         :param task_types: A dictionary containing the task type for each dataset.
+        :param task_implementation: The implementation of the task, either 'none',
+            or 'instruction-based'.
         :param max_batches: The maximum number of batches after which to stop.
         :param absolute_sampling_rates: Whether the provided sampling rates should be
             understood as absolute or as up/down-sampling rates.
@@ -308,10 +344,14 @@ class MultiS3EmbeddingDataset(IterableDataset):
         super().__init__()
         self._bucket = bucket
         self._batch_size = batch_size
+        self._world_size = world_size
+        self._global_rank = global_rank
         self._input_type_dict = input_type_dict
         self._synchronous = synchronous
         self._task_types = task_types or dict()
+        self._task_implementation = task_implementation
 
+        datasets: Optional[Union[List[str], List[Dict[str, Any]]]]
         if datasets is None:
             if not os.path.exists(self._bucket):
                 datasets = [
@@ -328,34 +368,37 @@ class MultiS3EmbeddingDataset(IterableDataset):
 
         if isinstance(datasets, list):
             self._datasets = {
-                ds_path: S3EmbeddingDataset(
+                dspath: S3Dataset(
                     bucket,
-                    _path_to_name(ds_path),
-                    input_type_dict=input_type_dict,
-                    task_type=self._task_types.get(ds_path),
-                    directory=_path_to_dir(ds_path),
-                    max_shards=max_shards,
+                    _path_to_name(dspath),
                     world_size=world_size,
                     global_rank=global_rank,
+                    input_type_dict=input_type_dict,
+                    task_type=self._task_types.get(dspath),
+                    task_implementation=self._task_implementation,
+                    directory=_path_to_dir(dspath),
+                    max_shards=max_shards,
                     dialect=dialect,
                     interleaved=synchronous,
                 )
-                for ds_path in datasets
+                for dspath in datasets
             }
         else:
+            datasets: Dict[str, Dict[str, Any]]
             self._datasets = {
-                ds_path: S3EmbeddingDataset(
+                dspath: S3Dataset(
                     bucket=bucket,
-                    dataset=_path_to_name(ds_path),
-                    directory=_path_to_dir(ds_path),
+                    dataset=_path_to_name(dspath),
+                    directory=_path_to_dir(dspath),
+                    world_size=world_size,
+                    global_rank=global_rank,
                     interleaved=synchronous,
                     input_type_dict=input_type_dict,
-                    task_type=self._task_types.get(ds_path),
+                    task_type=self._task_types.get(dspath),
+                    task_implementation=self._task_implementation,
                     max_shards=dataset['max_shards'],
                     dialect=dataset['dialect'],
                     shard_num=dataset['current_shard_num'],
-                    world_size=world_size,
-                    global_rank=global_rank,
                     index=dataset['current_index'],
                     **(
                         {'ce_model_name': kwargs['ce_model_name']}
@@ -363,8 +406,9 @@ class MultiS3EmbeddingDataset(IterableDataset):
                         else {}
                     ),
                 )
-                for ds_path, dataset in datasets.items()
+                for dspath, dataset in datasets.items()
             }
+
         self._sampling_rates = {
             ds_path: len(dataset) for ds_path, dataset in self._datasets.items()
         }
@@ -398,8 +442,6 @@ class MultiS3EmbeddingDataset(IterableDataset):
                 del self._datasets[ds_path]
         self._max_batches = max_batches
         self._num_batches = num_batches
-        self._world_size = world_size
-        self._global_rank = global_rank
 
         self.current_dataset = None
 
@@ -416,7 +458,7 @@ class MultiS3EmbeddingDataset(IterableDataset):
         while not self._max_batches or self._max_batches > self._num_batches:
             dataset = self._rng.choices(
                 list(self._sampling_rates.keys()),
-                weights=[v for v in self._sampling_rates.values()],
+                weights=list(self._sampling_rates.values()),
             )[0]
             self.current_dataset = dataset
 
@@ -427,7 +469,9 @@ class MultiS3EmbeddingDataset(IterableDataset):
                 except StopIteration:
                     log_on_rank(f'reached the end of dataset {dataset}, rebuilding')
                     self._datasets[dataset].cleanup()
-                    self._datasets[dataset] = self.rebuild_dataset(dataset)
+                    self._datasets[dataset] = self.rebuild_dataset(
+                        dataset, self._world_size, self._global_rank
+                    )
                     sources[dataset] = iter(self._datasets[dataset])
                     yield next(sources[dataset])
 
@@ -436,17 +480,18 @@ class MultiS3EmbeddingDataset(IterableDataset):
     def __len__(self):
         return self._max_batches * self._batch_size
 
-    def rebuild_dataset(self, dataset: str):
-        return S3EmbeddingDataset(
+    def rebuild_dataset(self, dataset: str, world_size: int, global_rank: int):
+        return S3Dataset(
             bucket=self._bucket,
             dataset=_path_to_name(dataset),
+            world_size=world_size,
+            global_rank=global_rank,
             directory=_path_to_dir(dataset),
-            world_size=self._world_size,
-            global_rank=self._global_rank,
             max_shards=self._datasets[dataset]._max_shards,
             dialect=self._datasets[dataset]._dialect,
             input_type_dict=self._input_type_dict,
             task_type=self._task_types.get(dataset),
+            task_implementation=self._task_implementation,
             interleaved=self._synchronous,
         )
 
@@ -465,6 +510,7 @@ class MultiS3EmbeddingDataset(IterableDataset):
             },
             'sampling_rates': self._sampling_rates,
             'task_types': self._task_types,
+            'task_implementation': self._task_implementation,
             'max_batches': self._max_batches,
             'num_batches': self._num_batches,
             'input_type_dict': self._input_type_dict,
@@ -480,12 +526,13 @@ class MultiS3EmbeddingDataset(IterableDataset):
     def load_state_dict(cls, state_dict, world_size: int, global_rank: int):
         return cls(
             bucket=state_dict['bucket'],
+            world_size=world_size,
+            global_rank=global_rank,
             input_type_dict=state_dict['input_type_dict'],
             datasets=state_dict['datasets'],
             sampling_rates=state_dict['sampling_rates'],
-            world_size=world_size,
-            global_rank=global_rank,
             task_types=state_dict['task_types'],
+            task_implementation=state_dict['task_implementation'],
             batch_size=state_dict['batch_size'],
             max_batches=state_dict['max_batches'],
             num_batches=state_dict['num_batches'],
@@ -495,17 +542,19 @@ class MultiS3EmbeddingDataset(IterableDataset):
 
     def write_to_json(self, fname: str):
         directory_path = os.path.dirname(fname)
-        if not os.path.exists(directory_path):
-            os.makedirs(directory_path)
-        with open(fname, 'w') as json_file:
-            json.dump(self.state_dict(), json_file)
+        try:
+            if not os.path.exists(directory_path):
+                os.makedirs(directory_path)
+            with open(fname, 'w') as json_file:
+                json.dump(self.state_dict(), json_file)
+        except Exception as e:
+            _ = str(e)
+            log_on_rank('File already exist, skipping.')  # avoid race condition
 
     @classmethod
     def load_from_json(cls, fname: str, world_size: int, global_rank: int):
         with open(fname, 'r') as json_file:
-            return cls.load_state_dict(
-                json.load(json_file), world_size=world_size, global_rank=global_rank
-            )
+            return cls.load_state_dict(json.load(json_file), world_size, global_rank)
 
     @property
     def num_batches(self):

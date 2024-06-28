@@ -3,6 +3,7 @@ Code adapated from
 https://github.com/mlfoundations/open_clip/blob/main/src/training/zero_shot.py
 Thanks to the authors of OpenCLIP
 """
+
 from contextlib import suppress
 from typing import Any, Optional, Union
 
