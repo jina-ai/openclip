@@ -70,6 +70,19 @@ def parse_args(args):
         ),
     )
     parser.add_argument(
+        '--train-data-assigned-groupids',
+        type=str,
+        default=None,
+        help=(
+            'When using multiple data sources with webdataset and sampling with '
+            'replacement, this can be used to assign each data source to a specific '
+            'worker group. Similar to --train-data, this should be a string '
+            'with as many numbers as there are data sources, separated by `::` '
+            '(e.g. 0::1::0). By default, all data sources are assigned to all worker '
+            'groups.'
+        ),
+    )
+    parser.add_argument(
         '--train-txtdata',
         type=str,
         default=None,
@@ -112,6 +125,12 @@ def parse_args(args):
         type=str,
         default=None,
         help='Similar to --train-data-upsampling-factors, but for --train-imgdata.',
+    )
+    parser.add_argument(
+        '--train-imgdata-assigned-groupids',
+        type=str,
+        default=None,
+        help='Similar to --train-data-assigned-groupids, but for --train-imgdata.',
     )
     parser.add_argument(
         '--train-mtldata',
