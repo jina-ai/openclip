@@ -332,12 +332,12 @@ def train_one_epoch(
     _sample_digits = math.ceil(math.log(train_dataloader.num_samples + 1, 10))
 
     accum_images, accum_texts, accum_features = [], [], {}
-    accum_mtl_datasets, accum_mtl_batches, accum_mtl_labels, accum_mtl_features = (
-        [],
-        [],
-        [],
-        [],
-    )
+    (
+        accum_mtl_datasets,
+        accum_mtl_labels,
+        accum_mtl_texts,
+        accum_mtl_features,
+    ) = [], [], [], []
     losses_m = {}
     _batch_time_m = AverageMeter()
     _data_time_m = AverageMeter()
@@ -394,12 +394,24 @@ def train_one_epoch(
             images_right = images_right.to(device=device)
             allimages.extend([images_left, images_right])
 
+        run_mtl_training = False
+        run_mtl_pair_training = False
+        run_mtl_triplet_training = False
         if mtlbatch:
-            mtl_batch_size = args.mtl_batch_size
-            for mb in mtlbatch:
-                mb.to(device=device)
-        if mtllabels:
-            mtllabels[0] = [label.to(device=device) for label in mtllabels[0]]
+            run_mtl_training = True
+            if len(mtllabels) == 0:
+                run_mtl_pair_training = True
+                mtl_batch_size = mtlbatch[0]['input_ids'].shape[0] // 2
+                for mb in mtlbatch:
+                    mb.to(device=device)
+                    alltexts.append(mb['input_ids'])
+            else:
+                run_mtl_triplet_training = True
+                mtllabels[0] = [label.to(device=device) for label in mtllabels[0]]
+                mtl_batch_size = mtlbatch[0]['input_ids'].shape[0]
+                for mb in mtlbatch:
+                    mb.to(device=device)
+                    alltexts.append(mb['input_ids'])
 
         allimages = torch.cat(allimages, dim=0)
         alltexts = torch.cat(alltexts, dim=0)
@@ -458,6 +470,17 @@ def train_one_epoch(
                 logit_scale = modelout['logit_scale']
                 image_features = modelout.pop('image_features')
                 text_features = modelout.pop('text_features')
+                if run_mtl_training:
+                    if run_mtl_pair_training:
+                        mtl_features = [
+                            text_features[-2 * mtl_batch_size:-mtl_batch_size],
+                            text_features[-mtl_batch_size:],
+                        ]
+                        text_features = text_features[:-2*mtl_batch_size]
+                    elif run_mtl_triplet_training:
+                        mtl_features = [text_features[-mtl_batch_size:]]
+                        text_features = text_features[:-mtl_batch_size]
+
                 left_features = torch.cat(
                     [
                         image_features[:batch_size],
@@ -474,36 +497,29 @@ def train_one_epoch(
                     ],
                     dim=0,
                 )
-                losses = loss(left_features, right_features, **modelout)
 
-                if mtl_losses is not None:
+                losses = defaultdict(lambda: torch.zeros(1, device=device))
+
+                _losses = loss(left_features, right_features, **modelout)
+                contrastive_loss = sum(_losses.values())
+                losses['contrastive_loss'] += contrastive_loss
+
+                if run_mtl_training:
                     mtllossfn = (
                         mtl_losses[mtldataset]
                         if mtldataset in mtl_losses
                         else mtl_losses['*']
                     )
-                    modelouts = [model(None, b['input_ids']) for b in mtlbatch]
-                    mtlfeats = []
-                    for out in modelouts:
-                        _ = out.pop('image_features')
-                        feats = out.pop('text_features')
-                        if len(mtllabels) == 0:
-                            mtlfeats.extend(
-                                [feats[:mtl_batch_size], feats[mtl_batch_size:]]
-                            )
-                        else:
-                            mtlfeats.append(feats)
-                    losskwargs = modelouts[0]
-                    losskwargs['output_dict'] = False
                     if mtl_logit_scale is not None:
-                        losskwargs['logit_scale'] = mtl_logit_scale
-                    logit_scale_mtl = losskwargs['logit_scale']
+                        _ = modelout.pop('logit_scale')
+                        modelout['logit_scale'] = mtl_logit_scale
+                    logit_scale_mtl = modelout['logit_scale']
 
-                    mtlloss = mtllossfn(*mtlfeats, *mtllabels, **losskwargs)
+                    mtlloss = mtllossfn(*mtl_features, *mtllabels, **modelout)
                     losses['mtl_loss'] = args.mtl_loss_weight * mtlloss
 
             total_loss = sum(losses.values())
-            losses['loss'] = total_loss
+            losses['loss'] += total_loss
             backward(total_loss, model, scaler=scaler, deepspeed=args.deepspeed)
 
         else:
@@ -511,57 +527,54 @@ def train_one_epoch(
 
             # First, cache the features without any gradient tracking.
             with torch.no_grad():
+
+                mtltexts = None
+                if run_mtl_triplet_training:
+                    mtltexts = alltexts[-mtl_batch_size:]
+                    alltexts = alltexts[:-mtl_batch_size]
+
+                accum_images.append(allimages)
+                accum_texts.append(alltexts)
+                accum_mtl_datasets.append(mtldataset)
+                accum_mtl_texts.append(mtltexts)
+                accum_mtl_labels.append(mtllabels)
+
                 with autocast():
                     modelout = model(allimages, alltexts)
                     image_features = modelout.pop('image_features')
                     text_features = modelout.pop('text_features')
-                    modelout['left_features'] = torch.cat(
-                        [
-                            image_features[:batch_size],
-                            text_features[batch_size: batch_size + texts_batch_size,],
-                            image_features[
-                                batch_size: batch_size + images_batch_size,
+                    if run_mtl_training and run_mtl_pair_training:
+                        mtl_features = [
+                            text_features[-2 * mtl_batch_size:-mtl_batch_size],
+                            text_features[-mtl_batch_size:],
+                        ]
+                        text_features = text_features[:-2 * mtl_batch_size]
+                        accum_mtl_features.append(mtl_features)
+                    accumulated = {
+                        'left_features': torch.cat(
+                            [
+                                image_features[:batch_size],
+                                text_features[batch_size: batch_size+texts_batch_size,],
+                                image_features[
+                                    batch_size: batch_size + images_batch_size,
+                                ],
                             ],
-                        ],
-                        dim=0,
-                    )
-                    modelout['right_features'] = torch.cat(
-                        [
-                            text_features[:batch_size],
-                            text_features[batch_size + texts_batch_size:,],
-                            image_features[batch_size + images_batch_size:],
-                        ],
-                        dim=0,
-                    )
-                    for f in ('logit_scale', 'logit_bias'):
-                        modelout.pop(f, None)
-
-                    for key, val in modelout.items():
+                            dim=0,
+                        ),
+                        'right_features': torch.cat(
+                            [
+                                text_features[:batch_size],
+                                text_features[batch_size + texts_batch_size:,],
+                                image_features[batch_size + images_batch_size:],
+                            ],
+                            dim=0,
+                        ),
+                    }
+                    for key, val in accumulated.items():
                         if key in accum_features:
                             accum_features[key].append(val)
                         else:
                             accum_features[key] = [val]
-
-                    if mtl_losses is not None:
-                        modelouts = [model(None, b['input_ids']) for b in mtlbatch]
-                        mtlfeats = []
-                        for out in modelouts:
-                            _ = out.pop('image_features')
-                            feats = out.pop('text_features')
-                            if len(mtllabels) == 0:
-                                mtlfeats.extend(
-                                    [feats[:mtl_batch_size], feats[mtl_batch_size:]]
-                                )
-                                accum_mtl_features.append(mtlfeats)
-
-                        if len(mtllabels) != 0:
-                            accum_mtl_labels.append(mtllabels)
-
-                accum_images.append(allimages)
-                accum_texts.append(alltexts)
-                if mtl_losses is not None:
-                    accum_mtl_datasets.append(mtldataset)
-                    accum_mtl_batches.append(mtlbatch)
 
             # If (i + 1) % accum_freq is not zero, move on to the next batch.
             if ((i + 1) % args.accum_freq) > 0:
@@ -578,8 +591,8 @@ def train_one_epoch(
                 accum_images, accum_texts, accum_features = [], [], {}
                 (
                     accum_mtl_datasets,
-                    accum_mtl_batches,
                     accum_mtl_labels,
+                    accum_mtl_texts,
                     accum_mtl_features,
                 ) = [], [], [], []
                 continue
@@ -600,11 +613,27 @@ def train_one_epoch(
                 with autocast():
                     allimages = accum_images[k]
                     alltexts = accum_texts[k]
+                    mtltexts = accum_mtl_texts[k]
+
+                    if run_mtl_triplet_training:
+                        alltexts = torch.cat([alltexts, mtltexts], dim=0)
 
                     modelout = model(allimages, alltexts)
                     modelout['output_dict'] = True
                     image_features = modelout.pop('image_features')
                     text_features = modelout.pop('text_features')
+
+                    if run_mtl_training:
+                        if run_mtl_pair_training:
+                            mtl_features = [
+                                text_features[-2 * mtl_batch_size:-mtl_batch_size],
+                                text_features[-mtl_batch_size:],
+                            ]
+                            text_features = text_features[:-2 * mtl_batch_size]
+                        elif run_mtl_triplet_training:
+                            mtl_features = [text_features[-mtl_batch_size:]]
+                            text_features = text_features[:-mtl_batch_size]
+
                     modelout['left_features'] = torch.cat(
                         [
                             image_features[:batch_size],
@@ -640,49 +669,30 @@ def train_one_epoch(
 
                     _losses = loss(**inputs, **inputs_no_accum, output_dict=True)
                     del inputs
-                    del inputs_no_accum
                     contrastive_loss = sum(_losses.values())
                     losses['contrastive_loss'] += contrastive_loss
                     total_loss = contrastive_loss
 
-                    if mtl_losses is not None:
+                    if run_mtl_training:
                         mtldataset = accum_mtl_datasets[k]
-                        mtlbatch = accum_mtl_batches[k]
                         mtllossfn = (
                             mtl_losses[mtldataset]
                             if mtldataset in mtl_losses
                             else mtl_losses['*']
                         )
-                        modelouts = [model(None, b['input_ids']) for b in mtlbatch]
-                        inputs_no_accum = {
-                            'logit_scale': modelouts[0].pop('logit_scale')
-                        }
-                        if 'logit_bias' in modelouts[0]:
-                            inputs_no_accum['logit_bias'] = modelout.pop('logit_bias')
-
                         if mtl_logit_scale is not None:
                             inputs_no_accum['logit_scale'] = mtl_logit_scale
+
                         logit_scale_mtl = inputs_no_accum['logit_scale']
 
-                        mtlfeats = []
-                        for out in modelouts:
-                            _ = out.pop('image_features')
-                            feats = out.pop('text_features')
-                            if len(mtllabels) == 0:
-                                mtlfeats.extend(
-                                    [feats[:mtl_batch_size], feats[mtl_batch_size:]]
-                                )
-                            else:
-                                mtlfeats.append(feats)
-
-                        if len(accum_mtl_labels) == 0:
+                        if run_mtl_pair_training:
                             inputs = []
                             _cached_features = list(zip(*accum_mtl_features))
                             for idx, _cached_feature in enumerate(_cached_features):
                                 inputs.append(
                                     torch.cat(
                                         _cached_feature[:k]
-                                        + (mtlfeats[idx],)
+                                        + (mtl_features[idx],)
                                         + _cached_feature[k + 1:]
                                     )
                                 )
@@ -690,10 +700,10 @@ def train_one_epoch(
                                 *inputs, **inputs_no_accum, output_dict=False
                             )
                             del inputs
-                        else:
+                        elif run_mtl_triplet_training:
                             mtllabels = accum_mtl_labels[k]
                             mtlloss = mtllossfn(
-                                *mtlfeats,
+                                *mtl_features,
                                 *mtllabels,
                                 **inputs_no_accum,
                                 output_dict=False,
@@ -742,8 +752,8 @@ def train_one_epoch(
             accum_images, accum_texts, accum_features = [], [], {}
             (
                 accum_mtl_datasets,
-                accum_mtl_batches,
                 accum_mtl_labels,
+                accum_mtl_texts,
                 accum_mtl_features,
             ) = [], [], [], []
 
