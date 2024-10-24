@@ -692,18 +692,14 @@ def evaluate(
     data,
     epoch: int,
     args,
+    step_now: int = 0,
     tb_writer: Any = None,
 ):
     metrics = {}
     if not is_master(args):
         return metrics
 
-    if 'train' in data:
-        dataloader = data['train'].dataloader
-        num_batches_per_epoch = dataloader.num_batches // args.accum_freq
-        step = num_batches_per_epoch * epoch
-    else:
-        step = None
+    step = step_now
 
     model.eval()
 

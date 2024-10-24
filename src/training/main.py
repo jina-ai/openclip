@@ -566,6 +566,8 @@ def main(args):
         dataset_records = train_one_epoch(
             model,
             data,
+            preprocess_val,
+            tokenizer,
             loss,
             mtl_losses,
             epoch,
